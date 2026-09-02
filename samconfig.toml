@@ -1,0 +1,13 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "intelligent-storage-cost-optimizer"
+resolve_s3 = false
+s3_bucket = "cad-project-sam-deploy-431684228962"
+s3_prefix = "intelligent-storage-cost-optimizer"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM"
+image_repositories = []
+
+[default.global.parameters]
+region = "ap-south-1"
