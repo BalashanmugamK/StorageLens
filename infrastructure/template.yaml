@@ -31,6 +31,20 @@ Resources:
       KeySchema:
         - AttributeName: document_id
           KeyType: HASH
+  AccessHistoryTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: access_timestamp
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+        - AttributeName: access_timestamp
+          KeyType: RANGE
 
   DocumentsFunction:
     Type: AWS::Serverless::Function
@@ -46,6 +60,7 @@ Resources:
             - Effect: Allow
               Action:
                 - s3:PutObject
+                - s3:GetObject
               Resource: !Sub "${DocumentsBucket.Arn}/*"
 
             - Effect: Allow
@@ -55,10 +70,17 @@ Resources:
                 - dynamodb:Scan
               Resource: !GetAtt DocumentsTable.Arn
 
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+              Resource: !GetAtt AccessHistoryTable.Arn
+
       Environment:
         Variables:
           DOCUMENTS_BUCKET: !Ref DocumentsBucket
           DOCUMENTS_TABLE: !Ref DocumentsTable
+          ACCESS_HISTORY_TABLE: !Ref AccessHistoryTable
 
       Events:
         DocumentsApi:
@@ -74,6 +96,19 @@ Resources:
             ApiId: !Ref DocumentsHttpApi
             Path: /documents/{document_id}
             Method: ANY
+
+        DocumentDownloadApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents/{document_id}/download
+            Method: GET
+        DocumentAccessStatsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents/{document_id}/access-stats
+            Method: GET
 
   DocumentsHttpApi:
     Type: AWS::Serverless::HttpApi

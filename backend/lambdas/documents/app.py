@@ -1,21 +1,26 @@
 import json
 import os
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 
 import boto3
-from decimal import Decimal
+
+
 s3 = boto3.client(
     "s3",
     region_name=os.environ.get("AWS_REGION", "ap-south-1"),
     endpoint_url="https://s3.ap-south-1.amazonaws.com"
 )
+
 dynamodb = boto3.resource("dynamodb")
 
 BUCKET_NAME = os.environ["DOCUMENTS_BUCKET"]
 TABLE_NAME = os.environ["DOCUMENTS_TABLE"]
+ACCESS_HISTORY_TABLE_NAME = os.environ["ACCESS_HISTORY_TABLE"]
 
 table = dynamodb.Table(TABLE_NAME)
+access_history_table = dynamodb.Table(ACCESS_HISTORY_TABLE_NAME)
 
 
 def response(status_code, body):
@@ -24,8 +29,14 @@ def response(status_code, body):
         "headers": {
             "Content-Type": "application/json"
         },
-        "body": json.dumps(body, default=lambda value: int(value) if isinstance(value, Decimal) else str(value))
+        "body": json.dumps(
+            body,
+            default=lambda value: int(value)
+            if isinstance(value, Decimal)
+            else str(value)
+        )
     }
+
 
 def lambda_handler(event, context):
     method = event.get("requestContext", {}).get("http", {}).get("method")
@@ -36,6 +47,14 @@ def lambda_handler(event, context):
 
     if method == "GET" and path == "/documents":
         return list_documents()
+
+    if method == "GET" and path.startswith("/documents/") and path.endswith("/download"):
+        document_id = path.split("/")[-2]
+        return download_document(document_id)
+    
+    if method == "GET" and path.startswith("/documents/") and path.endswith("/access-stats"):
+        document_id = path.split("/")[-2]
+        return get_access_stats(document_id)
 
     if method == "GET" and path.startswith("/documents/"):
         document_id = path.split("/")[-1]
@@ -201,5 +220,150 @@ def get_document(document_id):
             500,
             {
                 "error": "Failed to retrieve document"
+            }
+        )
+
+
+def download_document(document_id):
+    if not document_id:
+        return response(
+            400,
+            {
+                "error": "document_id is required"
+            }
+        )
+
+    try:
+        # Verify that the document exists.
+        result = table.get_item(
+            Key={
+                "document_id": document_id
+            }
+        )
+
+        document = result.get("Item")
+
+        if not document:
+            return response(
+                404,
+                {
+                    "error": "Document not found"
+                }
+            )
+
+        # Record the access event.
+        access_timestamp = datetime.now(timezone.utc).isoformat()
+
+        access_history_table.put_item(
+            Item={
+                "document_id": document_id,
+                "access_timestamp": access_timestamp,
+                "access_type": "DOWNLOAD"
+            }
+        )
+
+        # Generate a temporary download URL.
+        download_url = s3.generate_presigned_url(
+            ClientMethod="get_object",
+            Params={
+                "Bucket": BUCKET_NAME,
+                "Key": document["object_key"]
+            },
+            ExpiresIn=900
+        )
+
+        return response(
+            200,
+            {
+                "document_id": document_id,
+                "download_url": download_url,
+                "access_timestamp": access_timestamp,
+                "access_type": "DOWNLOAD"
+            }
+        )
+
+    except Exception:
+        return response(
+            500,
+            {
+                "error": "Failed to prepare document download"
+            }
+        )
+def get_access_stats(document_id):
+    if not document_id:
+        return response(
+            400,
+            {
+                "error": "document_id is required"
+            }
+        )
+
+    try:
+        # Verify that the document exists.
+        document_result = table.get_item(
+            Key={
+                "document_id": document_id
+            }
+        )
+
+        document = document_result.get("Item")
+
+        if not document:
+            return response(
+                404,
+                {
+                    "error": "Document not found"
+                }
+            )
+
+        # Retrieve all access events for this document.
+        history_result = access_history_table.query(
+            KeyConditionExpression="document_id = :document_id",
+            ExpressionAttributeValues={
+                ":document_id": document_id
+            }
+        )
+
+        events = history_result.get("Items", [])
+
+        access_count = len(events)
+
+        if events:
+            last_accessed = max(
+                event["access_timestamp"]
+                for event in events
+            )
+        else:
+            last_accessed = None
+
+        # Count accesses during the last 30 days.
+        now = datetime.now(timezone.utc)
+        recent_cutoff = now - timedelta(days=30)
+
+        recent_access_count = 0
+
+        for event in events:
+            timestamp = datetime.fromisoformat(
+                event["access_timestamp"]
+            )
+
+            if timestamp >= recent_cutoff:
+                recent_access_count += 1
+
+        return response(
+            200,
+            {
+                "document_id": document_id,
+                "access_count": access_count,
+                "last_accessed": last_accessed,
+                "recent_access_count": recent_access_count
+            }
+        )
+
+    except Exception:
+        return response(
+            500,
+            {
+                "error": "Failed to calculate access statistics"
             }
         )
