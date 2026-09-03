@@ -32,6 +32,54 @@ Resources:
         - AttributeName: document_id
           KeyType: HASH
 
+  DocumentsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/documents/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 10
+      MemorySize: 128
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:PutObject
+              Resource: !Sub "${DocumentsBucket.Arn}/*"
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:Scan
+              Resource: !GetAtt DocumentsTable.Arn
+
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+
+      Events:
+        DocumentsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents
+            Method: ANY
+
+        DocumentByIdApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents/{document_id}
+            Method: ANY
+
+  DocumentsHttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+
 Outputs:
 
   DocumentsBucketName:

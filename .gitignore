@@ -45,3 +45,6 @@ experiments/results/*
 
 # Local data
 data/local/
+
+# AWS SAM generated files
+.aws-sam/
