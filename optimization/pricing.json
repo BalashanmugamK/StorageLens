@@ -1,0 +1,59 @@
+{
+  "region": "ap-south-1",
+  "currency": "USD",
+  "pricing_source": "AWS S3 Pricing",
+  "pricing_checked": "2026-09-10",
+  "retrieval_tier_assumption": "STANDARD",
+  "storage_classes": {
+    "STANDARD": {
+      "storage_per_gb_month": 0.025,
+      "get_request_per_1000": 0.0004,
+      "retrieval_request_per_1000": 0.0,
+      "retrieval_per_gb": 0.0,
+      "transition_per_1000": 0.0,
+      "minimum_storage_days": 0
+    },
+    "STANDARD_IA": {
+      "storage_per_gb_month": 0.0138,
+      "get_request_per_1000": 0.001,
+      "retrieval_request_per_1000": 0.0,
+      "retrieval_per_gb": 0.01,
+      "transition_per_1000": 0.01,
+      "minimum_storage_days": 30
+    },
+    "GLACIER_INSTANT_RETRIEVAL": {
+      "storage_per_gb_month": 0.005,
+      "get_request_per_1000": 0.01,
+      "retrieval_request_per_1000": 0.0,
+      "retrieval_per_gb": 0.03,
+      "transition_per_1000": 0.02,
+      "minimum_storage_days": 90
+    },
+    "GLACIER_FLEXIBLE_RETRIEVAL": {
+      "storage_per_gb_month": 0.0045,
+      "get_request_per_1000": 0.0004,
+      "retrieval_request_per_1000": 0.06,
+      "retrieval_per_gb": 0.012,
+      "transition_per_1000": 0.036,
+      "minimum_storage_days": 90
+    },
+    "GLACIER_DEEP_ARCHIVE": {
+      "storage_per_gb_month": 0.002,
+      "get_request_per_1000": 0.0004,
+      "retrieval_request_per_1000": 0.12,
+      "retrieval_per_gb": 0.024,
+      "transition_per_1000": 0.07,
+      "minimum_storage_days": 180
+    }
+  },
+  "model_assumptions": {
+    "planning_horizon_months": 12,
+    "days_per_year": 365,
+    "access_history_days": 30,
+    "access_event_type": "DOWNLOAD",
+    "retrieval_fraction": 1.0,
+    "transfer_cost_included": false,
+    "early_deletion_cost_modeled": false,
+    "temporary_restore_storage_modeled": false
+  }
+}
