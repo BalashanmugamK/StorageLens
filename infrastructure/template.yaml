@@ -46,6 +46,17 @@ Resources:
         - AttributeName: access_timestamp
           KeyType: RANGE
 
+  DocumentAggregatesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: document_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: document_id
+          KeyType: HASH
+
   DocumentsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -110,6 +121,48 @@ Resources:
             Path: /documents/{document_id}/access-stats
             Method: GET
 
+  AggregatesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/aggregates/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      Timeout: 60
+      MemorySize: 512
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+                - dynamodb:GetItem
+              Resource: !GetAtt DocumentsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !GetAtt AccessHistoryTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt DocumentAggregatesTable.Arn
+
+      Environment:
+        Variables:
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+          ACCESS_HISTORY_TABLE: !Ref AccessHistoryTable
+          AGGREGATES_TABLE: !Ref DocumentAggregatesTable
+
+      Events:
+        AggregatesRunApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /aggregates/run
+            Method: POST
+
   DocumentsHttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
@@ -124,3 +177,15 @@ Outputs:
   DocumentsTableName:
     Description: DynamoDB table used for document metadata
     Value: !Ref DocumentsTable
+
+  AccessHistoryTableName:
+    Description: DynamoDB table holding raw document access events
+    Value: !Ref AccessHistoryTable
+
+  DocumentsApiEndpoint:
+    Description: Base URL of the documents/aggregates HTTP API
+    Value: !Sub "https://${DocumentsHttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}"
+
+  DocumentAggregatesTableName:
+    Description: DynamoDB table containing aggregated document optimization features
+    Value: !Ref DocumentAggregatesTable

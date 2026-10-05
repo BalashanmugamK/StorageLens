@@ -1,0 +1,119 @@
+{
+  "_description": "LEAST-PRIVILEGE DEPLOYMENT IDENTITY POLICY for this repository. Review artifact only: an AWS administrator must substitute the placeholders and attach it manually. This repository's tooling NEVER modifies IAM automatically. Placeholders: {{ACCOUNT_ID}} = 12-digit target account id, {{REGION}} = the target deployment region, {{STACK_NAME}} = the samconfig.toml stack_name. Scope notes: (1) CloudFormation generated physical names start with the stack name, so every template resource is scoped to '<stack name>-*' patterns; S3 bucket names are lowercased accordingly. (2) 'aws-sam-cli-managed-*' is the documented prefix of the SAM CLI's code-artifact deployment bucket (samconfig has resolve_s3 = true). (3) Both functions have no explicit Role property, so CloudFormation creates and manages the execution roles - hence the iam: role-management actions; iam:PassRole is deliberately absent because CloudFormation creates these roles inside the same stack and binds them itself. (4) No wildcard-only actions/resources are used. Review with IAM Access Analyzer before attaching; a passing preflight (scripts/check_deployment_permissions.py) is evidence, not a guarantee - SCPs, session policies, and resource policies are outside its scope.",
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "CloudFormationStackLifecycle",
+      "Effect": "Allow",
+      "Action": [
+        "cloudformation:CreateStack",
+        "cloudformation:CreateChangeSet",
+        "cloudformation:ExecuteChangeSet",
+        "cloudformation:DescribeChangeSet",
+        "cloudformation:DeleteChangeSet",
+        "cloudformation:DescribeStacks",
+        "cloudformation:DeleteStack"
+      ],
+      "Resource": [
+        "arn:aws:cloudformation:{{REGION}}:{{ACCOUNT_ID}}:stack/{{STACK_NAME}}/*",
+        "arn:aws:cloudformation:{{REGION}}:{{ACCOUNT_ID}}:changeSet/{{STACK_NAME}}/*"
+      ]
+    },
+    {
+      "Sid": "SamManagedDeploymentBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutObject",
+        "s3:GetObject",
+        "s3:ListBucket",
+        "s3:GetBucketLocation",
+        "s3:DeleteObject",
+        "s3:DeleteBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::aws-sam-cli-managed-*",
+        "arn:aws:s3:::aws-sam-cli-managed-*/*"
+      ]
+    },
+    {
+      "Sid": "TemplateDocumentsBucket",
+      "Effect": "Allow",
+      "Action": [
+        "s3:CreateBucket",
+        "s3:PutEncryptionConfiguration",
+        "s3:GetEncryptionConfiguration",
+        "s3:PutPublicAccessBlock",
+        "s3:GetPublicAccessBlock",
+        "s3:DeleteBucket"
+      ],
+      "Resource": ["arn:aws:s3:::{{STACK_NAME}}-*"]
+    },
+    {
+      "Sid": "TemplateDynamoDbTables",
+      "Effect": "Allow",
+      "Action": [
+        "dynamodb:CreateTable",
+        "dynamodb:DescribeTable",
+        "dynamodb:DeleteTable",
+        "dynamodb:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:dynamodb:{{REGION}}:{{ACCOUNT_ID}}:table/{{STACK_NAME}}-*"
+      ]
+    },
+    {
+      "Sid": "TemplateLambdaFunctions",
+      "Effect": "Allow",
+      "Action": [
+        "lambda:CreateFunction",
+        "lambda:UpdateFunctionCode",
+        "lambda:UpdateFunctionConfiguration",
+        "lambda:GetFunction",
+        "lambda:DeleteFunction",
+        "lambda:AddPermission",
+        "lambda:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:lambda:{{REGION}}:{{ACCOUNT_ID}}:function:{{STACK_NAME}}-*"
+      ]
+    },
+    {
+      "Sid": "TemplateLambdaExecutionRoles",
+      "Effect": "Allow",
+      "Action": [
+        "iam:CreateRole",
+        "iam:GetRole",
+        "iam:PutRolePolicy",
+        "iam:GetRolePolicy",
+        "iam:DeleteRolePolicy",
+        "iam:DeleteRole",
+        "iam:TagRole",
+        "iam:UntagRole"
+      ],
+      "Resource": [
+        "arn:aws:iam::{{ACCOUNT_ID}}:role/{{STACK_NAME}}-*"
+      ]
+    },
+    {
+      "Sid": "TemplateHttpApi",
+      "Effect": "Allow",
+      "Action": [
+        "apigatewayv2:CreateApi",
+        "apigatewayv2:GetApi",
+        "apigatewayv2:UpdateApi",
+        "apigatewayv2:DeleteApi",
+        "apigatewayv2:CreateStage",
+        "apigatewayv2:GetStage",
+        "apigatewayv2:UpdateStage",
+        "apigatewayv2:CreateIntegration",
+        "apigatewayv2:GetIntegration",
+        "apigatewayv2:UpdateIntegration",
+        "apigatewayv2:CreateRoute",
+        "apigatewayv2:GetRoute",
+        "apigatewayv2:UpdateRoute"
+      ],
+      "Resource": ["arn:aws:apigateway:{{REGION}}::/apis*"]
+    }
+  ]
+}
