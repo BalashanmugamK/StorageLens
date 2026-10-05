@@ -45,6 +45,8 @@ experiments/results/*
 
 # Local data
 data/local/
+data/real/
+data/real/download_cache/
 
 # AWS SAM generated files
 .aws-sam/

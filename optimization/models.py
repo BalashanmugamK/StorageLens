@@ -29,6 +29,7 @@ class CostBreakdown:
 class TierCost:
     storage_class: str
     cost: CostBreakdown
+    retrieval_time_hours: float = 0.0
 
 
 @dataclass
@@ -42,6 +43,19 @@ class OptimizationResult:
     savings: float
     savings_percentage: float
     tier_costs: list[TierCost]
+    # State-eligibility policy applied: "A" (state-constrained)
+    # or "B" (cost-safe: current class joins the candidate set).
+    policy: str = "B"
+    # True whenever the current class is not state-eligible —
+    # flagged for both policies, whether the engine migrates
+    # anyway (Policy A) or keeps the object (Policy B).
+    policy_conflict: bool = False
+    # Classes the optimizer actually considered (Policy B adds
+    # the current class to the state-eligible set).
+    candidate_storage_classes: list[str] | None = None
+    # Informational: the destination tier's restore wait under
+    # the STANDARD retrieval tier. Does not gate selection.
+    recommended_retrieval_time_hours: float = 0.0
 
 
 @dataclass
@@ -57,3 +71,7 @@ class WorkloadSummary:
     optimized_retrieval_cost: float
     current_tier_distribution: dict[str, int]
     recommended_tier_distribution: dict[str, int]
+    # Number of documents whose current class is not eligible
+    # for their document state (Policy A migrates them anyway;
+    # Policy B keeps them when staying is cheaper).
+    policy_conflict_count: int = 0

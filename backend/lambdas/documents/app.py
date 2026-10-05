@@ -7,11 +7,10 @@ from decimal import Decimal
 import boto3
 
 
-s3 = boto3.client(
-    "s3",
-    region_name=os.environ.get("AWS_REGION", "ap-south-1"),
-    endpoint_url="https://s3.ap-south-1.amazonaws.com"
-)
+# Region comes from the Lambda runtime's AWS_REGION environment
+# variable (resolved by boto3), so the deployment works in any
+# region without a hard-coded regional endpoint.
+s3 = boto3.client("s3")
 
 dynamodb = boto3.resource("dynamodb")
 

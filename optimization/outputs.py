@@ -17,6 +17,7 @@ def optimization_result_to_dict(
                 "request_cost": round(tier.cost.request_cost, 6),
                 "transition_cost": round(tier.cost.transition_cost, 6),
                 "total_cost": round(tier.cost.total_cost, 6),
+                "retrieval_time_hours": tier.retrieval_time_hours,
             }
         )
 
@@ -25,6 +26,12 @@ def optimization_result_to_dict(
         "current_storage_class": result.current_storage_class,
         "recommended_storage_class": result.recommended_storage_class,
         "eligible_storage_classes": result.eligible_storage_classes,
+        "candidate_storage_classes": result.candidate_storage_classes,
+        "policy": result.policy,
+        "policy_conflict": result.policy_conflict,
+        "recommended_retrieval_time_hours": (
+            result.recommended_retrieval_time_hours
+        ),
         "current_cost": round(result.current_cost, 6),
         "recommended_cost": round(result.recommended_cost, 6),
         "savings": round(result.savings, 6),
@@ -58,4 +65,5 @@ def workload_summary_to_dict(
         "recommended_tier_distribution": (
             summary.recommended_tier_distribution
         ),
+        "policy_conflict_count": summary.policy_conflict_count,
     }

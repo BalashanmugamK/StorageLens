@@ -27,6 +27,7 @@ def calculate_workload_summary(
     optimized_retrieval_cost = 0.0
 
     transition_count = 0
+    policy_conflict_count = 0
 
     current_tier_distribution = {}
     recommended_tier_distribution = {}
@@ -61,6 +62,9 @@ def calculate_workload_summary(
         ):
             transition_count += 1
 
+        if getattr(result, "policy_conflict", False):
+            policy_conflict_count += 1
+
         for tier in result.tier_costs:
             if tier.storage_class == result.current_storage_class:
                 current_retrieval_cost += (
@@ -92,5 +96,8 @@ def calculate_workload_summary(
         current_retrieval_cost=current_retrieval_cost,
         optimized_retrieval_cost=optimized_retrieval_cost,
         current_tier_distribution=current_tier_distribution,
-        recommended_tier_distribution=recommended_tier_distribution,
+        recommended_tier_distribution=(
+            recommended_tier_distribution
+        ),
+        policy_conflict_count=policy_conflict_count,
     )

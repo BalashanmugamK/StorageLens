@@ -1,7 +1,10 @@
 import math
 
 from .constraints import get_eligible_storage_classes
-from .costs import calculate_tier_cost
+from .costs import (
+    calculate_tier_cost,
+    get_retrieval_time_hours_for_classes,
+)
 from .models import (
     OptimizerInput,
     OptimizationResult,
@@ -9,16 +12,59 @@ from .models import (
 )
 
 
-def optimize_document(document: OptimizerInput) -> OptimizationResult:
+# Policy A — state-constrained optimization: the document must
+# end up in a state-eligible storage class, and among those
+# classes the cheapest one is chosen, even when the cheapest
+# eligible class costs MORE than keeping the current class.
+POLICY_A = "A"
+
+# Policy B — cost-safe recommendation: the current class joins
+# the candidate set, so a cost-increasing migration is never
+# recommended. When the current class is not state-eligible and
+# is also the cheapest option, the object is kept in place and
+# the policy conflict is reported separately.
+POLICY_B = "B"
+
+DEFAULT_POLICY = POLICY_B
+
+
+def optimize_document(
+    document: OptimizerInput,
+    policy: str = DEFAULT_POLICY,
+) -> OptimizationResult:
     """Find the lowest-cost eligible storage class for a document."""
+
+    if policy not in (POLICY_A, POLICY_B):
+        raise ValueError(
+            f"Unsupported optimization policy: {policy} "
+            f"(expected {POLICY_A} or {POLICY_B})"
+        )
 
     eligible_classes = get_eligible_storage_classes(
         document.document_state
     )
 
+    # E(state) ∪ {current} under Policy B; E(state) otherwise.
+    candidate_classes = list(eligible_classes)
+
+    if (
+        policy == POLICY_B
+        and document.current_storage_class
+        not in candidate_classes
+    ):
+        candidate_classes.append(
+            document.current_storage_class
+        )
+
     tier_costs = []
 
-    for storage_class in eligible_classes:
+    retrieval_hours_by_class = (
+        get_retrieval_time_hours_for_classes(
+            candidate_classes
+        )
+    )
+
+    for storage_class in candidate_classes:
         cost = calculate_tier_cost(
             document,
             storage_class,
@@ -29,6 +75,11 @@ def optimize_document(document: OptimizerInput) -> OptimizationResult:
             TierCost(
                 storage_class=storage_class,
                 cost=cost,
+                retrieval_time_hours=(
+                    retrieval_hours_by_class[
+                        storage_class
+                    ]
+                ),
             )
         )
 
@@ -47,7 +98,7 @@ def optimize_document(document: OptimizerInput) -> OptimizationResult:
 
     recommended_storage_class = None
 
-    if document.current_storage_class in eligible_classes:
+    if document.current_storage_class in candidate_classes:
         current_candidate_cost = next(
             tier.cost.total_cost
             for tier in tier_costs
@@ -76,12 +127,25 @@ def optimize_document(document: OptimizerInput) -> OptimizationResult:
 
     savings = current_cost - recommended_cost
 
+    # Policy B never recommends a cost-increasing migration: the
+    # current class is already in the candidate set with no
+    # transition charge, so a negative number could only come
+    # from floating-point noise, and is floored to zero.
+    if policy == POLICY_B and savings < 0:
+        savings = 0.0
+
     if current_cost > 0:
         savings_percentage = (
             savings / current_cost
         ) * 100
     else:
         savings_percentage = 0.0
+
+    recommended_retrieval_time_hours = next(
+        tier.retrieval_time_hours
+        for tier in tier_costs
+        if tier.storage_class == recommended_storage_class
+    )
 
     return OptimizationResult(
         document_id=document.document_id,
@@ -93,4 +157,13 @@ def optimize_document(document: OptimizerInput) -> OptimizationResult:
         savings=savings,
         savings_percentage=savings_percentage,
         tier_costs=tier_costs,
+        policy=policy,
+        policy_conflict=(
+            document.current_storage_class
+            not in eligible_classes
+        ),
+        candidate_storage_classes=candidate_classes,
+        recommended_retrieval_time_hours=(
+            recommended_retrieval_time_hours
+        ),
     )

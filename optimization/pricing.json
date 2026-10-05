@@ -11,7 +11,11 @@
       "retrieval_request_per_1000": 0.0,
       "retrieval_per_gb": 0.0,
       "transition_per_1000": 0.0,
-      "minimum_storage_days": 0
+      "minimum_storage_days": 0,
+      "min_billable_object_bytes": 0,
+      "archive_overhead_bytes_at_glacier_rate": 0,
+      "archive_overhead_bytes_at_standard_rate": 0,
+      "retrieval_time_hours": 0
     },
     "STANDARD_IA": {
       "storage_per_gb_month": 0.0138,
@@ -19,7 +23,11 @@
       "retrieval_request_per_1000": 0.0,
       "retrieval_per_gb": 0.01,
       "transition_per_1000": 0.01,
-      "minimum_storage_days": 30
+      "minimum_storage_days": 30,
+      "min_billable_object_bytes": 128000,
+      "archive_overhead_bytes_at_glacier_rate": 0,
+      "archive_overhead_bytes_at_standard_rate": 0,
+      "retrieval_time_hours": 0
     },
     "GLACIER_INSTANT_RETRIEVAL": {
       "storage_per_gb_month": 0.005,
@@ -27,7 +35,11 @@
       "retrieval_request_per_1000": 0.0,
       "retrieval_per_gb": 0.03,
       "transition_per_1000": 0.02,
-      "minimum_storage_days": 90
+      "minimum_storage_days": 90,
+      "min_billable_object_bytes": 128000,
+      "archive_overhead_bytes_at_glacier_rate": 0,
+      "archive_overhead_bytes_at_standard_rate": 0,
+      "retrieval_time_hours": 0
     },
     "GLACIER_FLEXIBLE_RETRIEVAL": {
       "storage_per_gb_month": 0.0045,
@@ -35,7 +47,11 @@
       "retrieval_request_per_1000": 0.06,
       "retrieval_per_gb": 0.012,
       "transition_per_1000": 0.036,
-      "minimum_storage_days": 90
+      "minimum_storage_days": 90,
+      "min_billable_object_bytes": 32000,
+      "archive_overhead_bytes_at_glacier_rate": 32000,
+      "archive_overhead_bytes_at_standard_rate": 8000,
+      "retrieval_time_hours": 5
     },
     "GLACIER_DEEP_ARCHIVE": {
       "storage_per_gb_month": 0.002,
@@ -43,7 +59,11 @@
       "retrieval_request_per_1000": 0.12,
       "retrieval_per_gb": 0.024,
       "transition_per_1000": 0.07,
-      "minimum_storage_days": 180
+      "minimum_storage_days": 180,
+      "min_billable_object_bytes": 32000,
+      "archive_overhead_bytes_at_glacier_rate": 32000,
+      "archive_overhead_bytes_at_standard_rate": 8000,
+      "retrieval_time_hours": 12
     }
   },
   "model_assumptions": {
@@ -53,7 +73,19 @@
     "access_event_type": "DOWNLOAD",
     "retrieval_fraction": 1.0,
     "transfer_cost_included": false,
-    "early_deletion_cost_modeled": false,
-    "temporary_restore_storage_modeled": false
+    "early_deletion_cost_modeled": true,
+    "early_deletion_fee_basis": "prorated remaining minimum-storage days of the CURRENT class, at the current class storage rate, on its billable size; charged as a one-time migration cost, only when moving",
+    "destination_early_exits_modeled": false,
+    "temporary_restore_storage_modeled": false,
+    "min_billable_size_modeled": true,
+    "archive_overhead_modeled": true,
+    "recency_weighting": {
+      "enabled": true,
+      "half_life_days": 30,
+      "applies_to": "expected annual downloads",
+      "formula": "weight = 0.5 ** (days_since_last_access / half_life_days); 1.0 when the document has no observed downloads"
+    },
+    "restore_latency_modeled": "informational only: retrieval_time_hours is reported per tier and for the recommendation, but does not gate selection",
+    "pricing_max_age_days": 90
   }
 }

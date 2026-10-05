@@ -1,0 +1,6 @@
+# No third-party dependencies are required.
+#
+# Both Lambda functions (backend/lambdas/documents and
+# backend/lambdas/aggregates) use only boto3, which is
+# provided by the AWS Lambda Python 3.13 runtime.
+# SAM build needs no additional packages.
