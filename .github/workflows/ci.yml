@@ -1,0 +1,84 @@
+name: CI
+
+# Every push/PR: backend handler suites (pytest), the frontend
+# (lint + vitest + typechecked build), and template validation
+# (sam validate + the template/preflight hardening tests). Deploy
+# remains a manual, operator-gated step — CI never deploys.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  backend:
+    name: Backend (pytest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Run backend tests
+        run: python -m pytest tests/ -q
+
+  frontend:
+    name: Frontend (lint + test + build)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Unit tests
+        run: npm test
+
+      - name: Typechecked build
+        run: npm run build
+
+  template:
+    name: Template (sam validate + hardening)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install AWS SAM CLI
+        uses: aws-actions/setup-sam@v2
+
+      - name: Install test dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Validate template
+        run: sam validate --template infrastructure/template.yaml
+
+      - name: Template + preflight hardening tests
+        run: |
+          python -m pytest tests/test_template_hardening.py \
+            tests/test_deployment_preflight.py -q

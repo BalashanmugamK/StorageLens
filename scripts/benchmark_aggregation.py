@@ -246,11 +246,19 @@ def main():
     print("=" * 62)
     print(json.dumps(runs, indent=2))
 
+    # Read from the production module so the artifact's worker count
+    # can never drift from the code actually benchmarked.
+    from backend.lambdas.aggregates.app import MAX_CONCURRENT_QUERIES
+
     RESULTS_JSON.write_text(
         json.dumps(
             {
                 "region": args.region,
                 "documents_available": full_count,
+                # Worker bound of the parallel pattern, recorded so
+                # consumers render the thread count from the artifact
+                # instead of hardcoding it (frontend/src/pages/Optimization.tsx).
+                "parallel_workers": MAX_CONCURRENT_QUERIES,
                 "runs": runs,
             },
             indent=2,

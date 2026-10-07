@@ -26,6 +26,7 @@ from optimization.access import (
 )
 from optimization.adapters import from_aggregate_item
 from optimization.costs import (
+    calculate_intelligent_tiering_blend,
     calculate_tier_cost,
     get_retrieval_time_hours,
     warn_if_pricing_stale,
@@ -234,17 +235,33 @@ def test_policy_conflict_when_current_ineligible():
         assert result.policy_conflict is True
 
 
-# Negative-savings case: current SIA, state ARCHIVED, high
-# retrieval load. Every state-eligible class costs MORE than
-# keeping SIA, so Policy A still forces the move (negative
-# savings), while Policy B keeps the object and flags the
-# conflict - the exact gap the Policy B definition closes.
+# Negative-savings case: current Deep Archive, state CLOSED
+# (which excludes Deep Archive from the eligible set), rare cold
+# access. Every state-eligible class costs MORE than keeping Deep
+# Archive, so Policy A still forces the move (negative savings),
+# while Policy B keeps the object and flags the conflict - the
+# exact gap the Policy B definition closes. (Earlier this same
+# case used a hot Standard-IA document; adding Intelligent-Tiering
+# as a candidate made IT the cheapest eligible class there, since
+# IT charges no retrieval fee, so the premise moved to a cold
+# document where Deep Archive's 0.002 rate wins.)
 def test_policy_b_never_recommends_cost_increase():
     document = make_document(
-        current="STANDARD_IA",
-        state="ARCHIVED",
-        access_count=30,
-        days_since_last_access=1,
+        current="GLACIER_DEEP_ARCHIVE",
+        state="CLOSED",
+        access_count=1,
+        days_since_last_access=180,
+    )
+
+    # The current class must genuinely be ineligible for the
+    # scenario to exercise the conflict path.
+    from optimization.constraints import (
+        get_eligible_storage_classes,
+    )
+
+    assert (
+        "GLACIER_DEEP_ARCHIVE"
+        not in get_eligible_storage_classes("CLOSED")
     )
 
     result_a = optimize_document(
@@ -255,7 +272,7 @@ def test_policy_b_never_recommends_cost_increase():
         result_a.recommended_storage_class
         == "GLACIER_FLEXIBLE_RETRIEVAL"
     )
-    assert result_a.savings < -0.5
+    assert result_a.savings < 0
     assert result_a.policy_conflict is True
 
     result_b = optimize_document(
@@ -264,7 +281,7 @@ def test_policy_b_never_recommends_cost_increase():
 
     assert (
         result_b.recommended_storage_class
-        == "STANDARD_IA"
+        == "GLACIER_DEEP_ARCHIVE"
     )
     assert result_b.savings == 0.0
     assert result_b.current_cost == pytest.approx(
@@ -272,13 +289,13 @@ def test_policy_b_never_recommends_cost_increase():
     )
     assert result_b.policy_conflict is True
     assert (
-        "STANDARD_IA"
+        "GLACIER_DEEP_ARCHIVE"
         in result_b.candidate_storage_classes
     )
     assert (
         result_b.candidate_storage_classes
         == result_b.eligible_storage_classes
-        + ["STANDARD_IA"]
+        + ["GLACIER_DEEP_ARCHIVE"]
     )
 
 
@@ -328,6 +345,7 @@ def test_retrieval_time_surfaced():
     # tier_costs covers the Policy B candidate set: the
     # ARCHIVED-eligible classes plus the current class.
     assert set(hours) == {
+        "INTELLIGENT_TIERING",
         "GLACIER_INSTANT_RETRIEVAL",
         "GLACIER_FLEXIBLE_RETRIEVAL",
         "GLACIER_DEEP_ARCHIVE",
@@ -394,3 +412,187 @@ def test_pricing_staleness_warning():
         # Restore pristine state for later tests, but mark it
         # clean so a fresh warning can fire again if needed.
         costs._STALENESS_WARNED = False
+
+
+# AWS's minimum-storage-duration clock starts at the transition
+# INTO the class, not at upload. An object transitioned into SIA
+# 5 days ago (though uploaded 100 days ago) leaving SIA now pays
+# the remaining 25 days on the 128 KB billable size:
+#
+#     fee = 25 * (0.0138 / 30) * (128000 / 1e9)
+#
+# Without current_class_since the anchor falls back to the upload
+# timestamp (100 days held), which would credit the full
+# pre-transition age and UNDERESTIMATE the fee to zero — the
+# defect this field exists to fix.
+def test_early_deletion_anchors_at_class_entry():
+    document = make_document(
+        file_size_bytes=50_000,
+        current="STANDARD_IA",
+        upload="2026-06-02T00:00:00Z",  # 100 days before aggregation
+    )
+
+    document.current_class_since = "2026-09-05T00:00:00Z"  # 5 days
+
+    cost = calculate_tier_cost(
+        document,
+        "STANDARD",
+        include_transition=True,
+    )
+
+    expected_fee = 25 * (0.0138 / 30) * (128_000 / GB_BYTES)
+
+    # Standard has no transition PUT fee; the only one-time cost
+    # of the move is the early-deletion fee.
+    assert cost.transition_cost == pytest.approx(
+        expected_fee, rel=1e-9
+    )
+
+    # Default anchor unchanged: same object without the field is
+    # 100 days held, so the 30-day minimum is fully served and
+    # no fee is due.
+    legacy_document = make_document(
+        file_size_bytes=50_000,
+        current="STANDARD_IA",
+        upload="2026-06-02T00:00:00Z",
+    )
+
+    legacy_cost = calculate_tier_cost(
+        legacy_document,
+        "STANDARD",
+        include_transition=True,
+    )
+
+    assert legacy_cost.transition_cost == 0.0
+
+
+# Intelligent-Tiering: the layer blend follows the homogeneous-
+# Poisson model. lambda = 36.5 downloads/yr means a mean gap of
+# 10 days, so P(cold > 30 d) = exp(-36.5*30/365) = exp(-3) and
+# P(cold > 90 d) = exp(-9). The three fractions must partition
+# the year exactly.
+def test_it_blend_poisson_fractions():
+    blend = calculate_intelligent_tiering_blend(36.5)
+
+    cold_30 = math.exp(-3.0)
+    cold_90 = math.exp(-9.0)
+
+    assert blend["archive_instant"] == pytest.approx(
+        cold_90, rel=1e-12
+    )
+    assert blend["infrequent"] == pytest.approx(
+        cold_30 - cold_90, rel=1e-12
+    )
+    assert blend["frequent"] == pytest.approx(
+        1.0 - cold_30, rel=1e-12
+    )
+    assert math.isclose(
+        sum(blend.values()), 1.0, rel_tol=1e-12
+    )
+
+
+# A never-again-accessed 1 GB object in Intelligent-Tiering
+# cools deterministically: 30 days Frequent, 60 Infrequent, 275
+# Archive-Instant. Hand-derived (prices from pricing.json):
+#
+#   blended rate = (30*0.025 + 60*0.0138 + 275*0.005) / 365
+#   storage      = blended * 1.0 GB * 12
+#   monitoring   = 0.0025/1000 * 12
+#   transition   = 0.01/1000  (S3-INTTransition, moving in)
+#
+# No GETs, no retrieval fees (IT never charges retrieval).
+def test_it_never_accessed_document_bills_the_cooling_curve():
+    document = make_document(current="STANDARD")
+
+    blended = (
+        30 * 0.025 + 60 * 0.0138 + 275 * 0.005
+    ) / 365
+
+    expected_storage = blended * 1.0 * 12
+
+    cost = calculate_tier_cost(
+        document,
+        "INTELLIGENT_TIERING",
+        include_transition=True,
+    )
+
+    assert cost.storage_cost == pytest.approx(
+        expected_storage, rel=1e-9
+    )
+    assert cost.request_cost == pytest.approx(
+        0.0025 / 1000 * 12, rel=1e-9
+    )
+    assert cost.retrieval_cost == 0.0
+    assert cost.transition_cost == pytest.approx(
+        0.01 / 1000, rel=1e-9
+    )
+    assert cost.total_cost == pytest.approx(
+        expected_storage + 0.0025 / 1000 * 12 + 0.01 / 1000,
+        rel=1e-9,
+    )
+
+
+# A hot object (lambda = 365/yr) essentially never cools below
+# 30 days, so the blend is (almost) pure Frequent and IT's cost
+# converges to Standard's storage rate plus the monitoring fee.
+def test_it_hot_document_stays_frequent():
+    document = make_document(
+        access_count=30,
+        days_since_last_access=0,
+        current="STANDARD",
+    )
+
+    cost = calculate_tier_cost(
+        document,
+        "INTELLIGENT_TIERING",
+        include_transition=True,
+    )
+
+    assert cost.storage_cost == pytest.approx(
+        0.025 * 1.0 * 12, rel=1e-12
+    )
+    assert cost.request_cost == pytest.approx(
+        0.0025 / 1000 * 12 + 365 / 1000 * 0.0004,
+        rel=1e-9,
+    )
+
+
+# A 50 KB object never meets the 128 KB tiering threshold: it
+# stays Frequent all year, is never monitored, and is billed on
+# its real 50 KB (IT has no per-object billing floor):
+#
+#   storage = 0.025 * 12 * (50_000 / 1e9)
+def test_it_small_object_never_tiers_or_is_monitored():
+    document = make_document(
+        file_size_bytes=50_000,
+        current="STANDARD",
+    )
+
+    cost = calculate_tier_cost(
+        document,
+        "INTELLIGENT_TIERING",
+        include_transition=True,
+    )
+
+    assert cost.storage_cost == pytest.approx(
+        0.025 * 12 * (50_000 / GB_BYTES), rel=1e-9
+    )
+    assert cost.request_cost == 0.0
+    assert cost.retrieval_cost == 0.0
+    assert cost.transition_cost == pytest.approx(
+        0.01 / 1000, rel=1e-9
+    )
+
+
+# Staying in IT bills no migration cost, as with every class.
+def test_it_staying_put_costs_no_transition():
+    document = make_document(current="INTELLIGENT_TIERING")
+
+    cost = calculate_tier_cost(
+        document,
+        "INTELLIGENT_TIERING",
+        include_transition=False,
+    )
+
+    assert cost.transition_cost == 0.0
+    assert cost.total_cost == cost.storage_cost + cost.request_cost

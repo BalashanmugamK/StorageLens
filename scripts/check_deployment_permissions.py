@@ -304,6 +304,67 @@ def extract_deployment_requirements(template):
                 )
             )
 
+            # Function event wiring: SAM's Schedule events become
+            # EventBridge rules (the on-call daily reconciler joins
+            # the aggregates/reconciliation schedules) and SNS events
+            # subscribe the function to the alarms topic.
+            event_types = {
+                event["Type"]
+                for event in (props.get("Events") or {}).values()
+                if isinstance(event, dict)
+            }
+
+            if "Schedule" in event_types:
+                requirements.extend(
+                    [
+                        Requirement(
+                            "events:PutRule",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "create the daily on-call reconcile rule",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:DescribeRule",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "CloudFormation readback of the "
+                            "schedule rule",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:PutTargets",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "target the function from the rule",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:DeleteTargets",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "rule target updates on re-deploy",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:DeleteRule",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "schedule rule rollback/cleanup",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:EnableRule",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "enable/disable the schedule when the "
+                            "template flips Enabled",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "events:DisableRule",
+                            "EVENTBRIDGE_SCHEDULES",
+                            "disable the schedule while the rule "
+                            "is being swapped",
+                            affected=logical_id,
+                        ),
+                    ]
+                )
+
             if not props.get("Role"):
                 # Default role creation: CloudFormation builds an
                 # execution role and its inline policy from this
@@ -360,6 +421,274 @@ def extract_deployment_requirements(template):
                         action, "APIS",
                         "HTTP API ($default stage) lifecycle "
                         "managed by CloudFormation",
+                        affected=logical_id,
+                    )
+                )
+
+            auth_config = props.get("Auth") or {}
+            has_authorizer = (
+                isinstance(auth_config, dict)
+                and bool(auth_config.get("Authorizers"))
+            )
+
+            if has_authorizer:
+                # A JWT authorizer is a separate API Gateway object
+                # created/updated/deleted alongside the API.
+                for action, reason in [
+                    ("apigatewayv2:CreateAuthorizer",
+                     "JWT authorizer for the HTTP API"),
+                    ("apigatewayv2:GetAuthorizer",
+                     "CloudFormation readback of the authorizer"),
+                    ("apigatewayv2:UpdateAuthorizer",
+                     "authorizer updates on re-deploy"),
+                    ("apigatewayv2:DeleteAuthorizer",
+                     "authorizer rollback/cleanup"),
+                ]:
+                    requirements.append(
+                        Requirement(
+                            action, "APIS", reason,
+                            affected=logical_id,
+                        )
+                    )
+
+        elif rtype == "AWS::Cognito::UserPool":
+            for action, reason in [
+                ("cognito-idp:CreateUserPool",
+                 "create the user pool backing the API's JWT "
+                 "authorizer"),
+                ("cognito-idp:DescribeUserPool",
+                 "CloudFormation readback of the pool"),
+                ("cognito-idp:UpdateUserPool",
+                 "pool updates on re-deploy"),
+                ("cognito-idp:DeleteUserPool",
+                 "pool rollback/cleanup"),
+                ("cognito-idp:TagResource",
+                 "stack-tag propagation onto the pool"),
+                ("cognito-idp:UntagResource",
+                 "stack-tag updates"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "COGNITO_USERPOOLS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::Cognito::UserPoolClient":
+            for action, reason in [
+                ("cognito-idp:CreateUserPoolClient",
+                 "public client the frontend signs in with"),
+                ("cognito-idp:DescribeUserPoolClient",
+                 "CloudFormation readback of the client"),
+                ("cognito-idp:UpdateUserPoolClient",
+                 "client updates on re-deploy"),
+                ("cognito-idp:DeleteUserPoolClient",
+                 "client rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "COGNITO_USERPOOLS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::Cognito::UserPoolDomain":
+            for action, reason in [
+                ("cognito-idp:CreateUserPoolDomain",
+                 "hosted-UI domain for the sign-in flow"),
+                ("cognito-idp:DescribeUserPoolDomain",
+                 "domain readback for the JWT authorizer issuer"),
+                ("cognito-idp:DeleteUserPoolDomain",
+                 "domain rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "COGNITO_USERPOOLS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::SNS::Topic":
+            for action, reason in [
+                ("sns:CreateTopic",
+                 "create the alarms topic"),
+                ("sns:GetTopicAttributes",
+                 "CloudFormation readback of the topic"),
+                ("sns:SetTopicAttributes",
+                 "topic attribute updates on re-deploy"),
+                ("sns:Subscribe",
+                 "optional alarm-email subscription"),
+                ("sns:DeleteTopic",
+                 "topic rollback/cleanup"),
+                ("sns:TagResource",
+                 "stack-tag propagation onto the topic"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "SNS_TOPICS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        # Created EMPTY by the template (no SecretString /
+        # GenerateSecretString): CloudFormation only needs the secret
+        # lifecycle, never the value actions.
+        elif rtype == "AWS::SecretsManager::Secret":
+            for action, reason in [
+                ("secretsmanager:CreateSecret",
+                 "create the empty PagerDuty credential secret"),
+                ("secretsmanager:DescribeSecret",
+                 "CloudFormation readback of the secret"),
+                ("secretsmanager:UpdateSecret",
+                 "secret updates on re-deploy (metadata only)"),
+                ("secretsmanager:TagResource",
+                 "stack-tag propagation onto the secret"),
+                ("secretsmanager:DeleteSecret",
+                 "secret rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "PD_SECRET", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::CloudWatch::Alarm":
+            for action, reason in [
+                ("cloudwatch:PutMetricAlarm",
+                 "create/update the alarm"),
+                ("cloudwatch:DescribeAlarms",
+                 "CloudFormation readback of the alarm"),
+                ("cloudwatch:DeleteAlarms",
+                 "alarm rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "CLOUDWATCH_ALARMS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::Logs::LogGroup":
+            for action, reason in [
+                ("logs:CreateLogGroup",
+                 "create the retained log group"),
+                ("logs:PutRetentionPolicy",
+                 "apply the declared RetentionInDays"),
+                ("logs:DeleteLogGroup",
+                 "log-group rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "LOG_GROUPS", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::Logs::ResourcePolicy":
+            for action, reason in [
+                ("logs:PutResourcePolicy",
+                 "grant API Gateway write access to the API "
+                 "access-log group"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "LOGS_ACCOUNT", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::Cognito::UserPoolGroup":
+            requirements.extend(
+                [
+                    Requirement(
+                        "cognito-idp:CreateGroup",
+                        "COGNITO_USERPOOLS",
+                        "RBAC group (Approvers / Users) the "
+                        "decisions lambda gates on",
+                        affected=logical_id,
+                    ),
+                    Requirement(
+                        "cognito-idp:UpdateGroup",
+                        "COGNITO_USERPOOLS",
+                        "group updates on re-deploy",
+                        affected=logical_id,
+                    ),
+                ]
+            )
+
+        elif rtype == "AWS::S3::BucketPolicy":
+            for action, reason in [
+                ("s3:PutBucketPolicy",
+                 "scope CloudFront's read grant to this "
+                 "distribution"),
+                ("s3:GetBucketPolicy",
+                 "CloudFormation readback of the declared policy"),
+                ("s3:DeleteBucketPolicy",
+                 "policy rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "TEMPLATE_BUCKET", reason,
+                        affected=logical_id,
+                    )
+                )
+
+            if (props or {}) and "cloudfront.amazonaws.com" in \
+                    json.dumps(props.get("PolicyDocument", {})):
+                requirements.extend(
+                    [
+                        Requirement(
+                            "cloudfront:GetDistribution",
+                            "CLOUDFRONT",
+                            "the bucket policy's condition references "
+                            "this distribution's ARN",
+                            affected=logical_id,
+                        ),
+                        Requirement(
+                            "cloudfront:GetDistributionConfig",
+                            "CLOUDFRONT",
+                            "CloudFormation readback while wiring the "
+                            "origin grant",
+                            affected=logical_id,
+                        ),
+                    ]
+                )
+
+        elif rtype == "AWS::CloudFront::OriginAccessControl":
+            for action, reason in [
+                ("cloudfront:CreateOriginAccessControl",
+                 "OAC signing for the frontend origin"),
+                ("cloudfront:UpdateOriginAccessControl",
+                 "OAC updates on re-deploy"),
+                ("cloudfront:GetOriginAccessControl",
+                 "CloudFormation readback of the OAC"),
+                ("cloudfront:DeleteOriginAccessControl",
+                 "OAC rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "CLOUDFRONT", reason,
+                        affected=logical_id,
+                    )
+                )
+
+        elif rtype == "AWS::CloudFront::Distribution":
+            for action, reason in [
+                ("cloudfront:CreateDistribution",
+                 "serve the SPA through CloudFront"),
+                ("cloudfront:GetDistribution",
+                 "CloudFormation readback of the distribution"),
+                ("cloudfront:GetDistributionConfig",
+                 "CloudFormation readback while creating it"),
+                ("cloudfront:UpdateDistribution",
+                 "distribution updates on re-deploy"),
+                ("cloudfront:DeleteDistribution",
+                 "distribution rollback/cleanup"),
+            ]:
+                requirements.append(
+                    Requirement(
+                        action, "CLOUDFRONT", reason,
                         affected=logical_id,
                     )
                 )
@@ -592,6 +921,62 @@ def build_scope_map(stack_name, region, account):
         "APIS": (
             f"arn:aws:apigateway:{region}::/apis*"
         ),
+        "CLOUDWATCH_ALARMS": (
+            f"arn:aws:cloudwatch:{region}:{account}"
+            f":alarm/{stack_name}-*"
+        ),
+        "LOG_GROUPS": [
+            (
+                f"arn:aws:logs:{region}:{account}"
+                f":log-group:/aws/lambda/{stack_name}-*"
+            ),
+            (
+                f"arn:aws:logs:{region}:{account}"
+                f":log-group:/aws/apigateway/{stack_name}/*"
+            ),
+        ],
+        "SNS_TOPICS": (
+            f"arn:aws:sns:{region}:{account}"
+            f":{stack_name}-alarms"
+        ),
+        # Secrets Manager secret-name ARNs: the random suffix part
+        # after the dash cannot be predicted pre-deploy, so a
+        # name-prefix wildcard of this stack's secret is the narrow
+        # form. No account-wide secret access is granted.
+        "PD_SECRET": [
+            (
+                f"arn:aws:secretsmanager:{region}:{account}"
+                f":secret:{stack_prefix}-pagerduty*"
+            ),
+            (
+                f"arn:aws:secretsmanager:{region}:{account}"
+                f":secret:{stack_prefix}-pagerduty*-*"
+            ),
+        ],
+        # EventBridge rules have no ARN readback pre-deploy that is
+        # stable; SAM-managed schedule rules are named after the
+        # stack + rule id, so the stack prefix wildcard is the
+        # narrowest reliable scope.
+        "EVENTBRIDGE_SCHEDULES": (
+            f"arn:aws:events:{region}:{account}"
+            f":rule/{stack_prefix}*"
+        ),
+        # Cognito user pool ids are server-generated (region_ + random
+        # suffix), so the create/client/domain actions cannot be scoped
+        # to a named ARN - the region prefix wildcard is as narrow as
+        # the pool resource type allows. This is a wildcard WITHIN the
+        # pool resource type, NOT a Resource "*", and is documented in
+        # the policy artifact's scope note.
+        "COGNITO_USERPOOLS": (
+            f"arn:aws:cognito-idp:{region}:{account}"
+            f":userpool/{region}_*"
+        ),
+        # logs:PutResourcePolicy has no resource-level permission
+        # support: IAM requires Resource "*". Scoping it to the
+        # log-group ARN would grant nothing, so this scope maps to
+        # the account wildcard and is the ONE documented exception
+        # in the deployment policy artifact.
+        "LOGS_ACCOUNT": "*",
     }
 
 
@@ -1200,6 +1585,8 @@ def scope_label(scope):
         "LAMBDA_FUNCTIONS": "stack Lambda functions",
         "IAM_ROLES": "stack execution roles",
         "APIS": "HTTP API",
+        "PD_SECRET": "PagerDuty credential secret",
+        "EVENTBRIDGE_SCHEDULES": "EventBridge schedule rules",
     }.get(scope, scope)
 
 

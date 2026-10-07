@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import random
 import time
@@ -11,6 +12,8 @@ import boto3
 import botocore.config
 from botocore.exceptions import BotoCoreError, ClientError
 from boto3.dynamodb.conditions import Attr, Key
+
+logger = logging.getLogger(__name__)
 
 
 OBSERVATION_PERIOD_DAYS = 30
@@ -233,7 +236,12 @@ def compute_aggregate_fields(document, access_events, now):
 
 
 def fetch_all_documents():
-    """Scan every document from DocumentsTable across pages."""
+    """Scan every document from DocumentsTable across pages.
+
+    Rows marked UPLOAD_PENDING describe a presigned upload that was
+    created but never HEAD-confirmed - the S3 object may not exist,
+    so aggregating them would size fiction. Verified and legacy rows
+    (no upload_status) flow through unchanged."""
 
     documents = []
     scan_kwargs = {}
@@ -241,7 +249,10 @@ def fetch_all_documents():
     while True:
         result = documents_table.scan(**scan_kwargs)
 
-        documents.extend(result.get("Items", []))
+        documents.extend(
+            item for item in result.get("Items", [])
+            if item.get("upload_status") != "UPLOAD_PENDING"
+        )
 
         last_key = result.get("LastEvaluatedKey")
 
@@ -424,6 +435,7 @@ def run_aggregation():
         )
 
     except Exception:
+        logger.exception("aggregation run failed")
         return response(
             500,
             {
@@ -432,12 +444,84 @@ def run_aggregation():
         )
 
 
+def aggregation_summary():
+    """GET /aggregates/stats — the LIVE state of the aggregation
+    pipeline, computed from the real tables on request: how many
+    documents exist, how many have fresh aggregates, the storage-
+    class distribution the engine will consume, and when the last
+    run happened. This is what the frontend's aggregation panels
+    should read instead of a bundled offline artifact when they
+    claim to describe the live system."""
+
+    try:
+        documents = fetch_all_documents()
+        document_ids = {item["document_id"] for item in documents}
+
+        aggregates = []
+        scan_kwargs = {}
+
+        while True:
+            result = aggregates_table.scan(**scan_kwargs)
+            aggregates.extend(result.get("Items", []))
+            last_key = result.get("LastEvaluatedKey")
+            if not last_key:
+                break
+            scan_kwargs["ExclusiveStartKey"] = last_key
+
+        class_distribution = {}
+        last_aggregation = None
+
+        aggregate_ids = set()
+
+        for aggregate in aggregates:
+            aggregate_ids.add(aggregate["document_id"])
+
+            storage_class = aggregate.get("current_storage_class")
+            key = str(storage_class) if storage_class else "UNKNOWN"
+            class_distribution[key] = class_distribution.get(key, 0) + 1
+
+            stamp = aggregate.get("aggregation_timestamp")
+
+            if stamp and (last_aggregation is None or str(stamp) > last_aggregation):
+                last_aggregation = str(stamp)
+
+        return response(
+            200,
+            {
+                "documents": len(documents),
+                "aggregates": len(aggregates),
+                "missing_aggregates": len(document_ids - aggregate_ids),
+                "last_aggregation_timestamp": last_aggregation,
+                "storage_class_distribution": class_distribution,
+                "access_window_days": OBSERVATION_PERIOD_DAYS,
+                "basis": (
+                    "Live counts from the documents and aggregates "
+                    "tables at request time"
+                ),
+            },
+        )
+
+    except Exception:
+        logger.exception("aggregation summary failed")
+        return response(500, {"error": "Failed to summarize aggregates"})
+
+
 def lambda_handler(event, context):
+    # EventBridge schedule: the "aws.events" schedule invocation
+    # carries no HTTP requestContext, so the HTTP routing below
+    # would 404 it (the daily aggregation silently no-op'ed before
+    # this branch existed).
+    if event.get("source") == "aws.events":
+        return run_aggregation()
+
     method = event.get("requestContext", {}).get("http", {}).get("method")
     path = event.get("rawPath", "")
 
     if method == "POST" and path == "/aggregates/run":
         return run_aggregation()
+
+    if method == "GET" and path == "/aggregates/stats":
+        return aggregation_summary()
 
     return response(
         404,

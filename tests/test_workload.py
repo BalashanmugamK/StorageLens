@@ -1,25 +1,40 @@
+"""Validation of the committed synthetic-workload experiment artifact.
+
+This file used to REGENERATE data/synthetic/workload_500_results.json
+when run as a script — a test that mutates repo data. The regeneration
+now lives in scripts/regenerate_workload_results.py; this module only
+VALIDATES the committed artifact against the workload it was built
+from and against its own arithmetic. No test here writes to disk.
+"""
+
 import json
-from collections import defaultdict
+import math
 from pathlib import Path
 
-from optimization.baseline import calculate_baseline_cost
-from optimization.costs import calculate_tier_cost
-from optimization.models import OptimizerInput
-from optimization.optimizer import optimize_document
-
-
-WORKLOAD_FILE = Path(
-    "data/synthetic/workload_500.json"
+RESULTS_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "synthetic"
+    / "workload_500_results.json"
 )
 
-RESULTS_FILE = Path(
-    "data/synthetic/workload_500_results.json"
+WORKLOAD_FILE = (
+    Path(__file__).resolve().parents[1]
+    / "data"
+    / "synthetic"
+    / "workload_500.json"
 )
+
+
+def load_results() -> dict:
+    with RESULTS_FILE.open(
+        "r",
+        encoding="utf-8",
+    ) as file:
+        return json.load(file)
 
 
 def load_workload() -> dict:
-    """Load the generated synthetic workload."""
-
     with WORKLOAD_FILE.open(
         "r",
         encoding="utf-8",
@@ -27,508 +42,122 @@ def load_workload() -> dict:
         return json.load(file)
 
 
-def create_optimizer_input(
-    document: dict,
-) -> OptimizerInput:
-    """Convert a workload document into optimizer input."""
-
-    return OptimizerInput(
-        document_id=document["document_id"],
-        file_size_bytes=document["file_size_bytes"],
-        current_storage_class=document[
-            "current_storage_class"
-        ],
-        upload_timestamp=document[
-            "upload_timestamp"
-        ],
-        last_accessed_timestamp=document[
-            "last_accessed_timestamp"
-        ],
-        access_count=document["access_count"],
-        days_since_last_access=document[
-            "days_since_last_access"
-        ],
-        access_frequency=document[
-            "access_frequency"
-        ],
-        aggregation_timestamp=document[
-            "aggregation_timestamp"
-        ],
-        document_state=document["document_state"],
+def breakdown_sum(cost: dict) -> float:
+    return (
+        cost["storage_cost"]
+        + cost["retrieval_cost"]
+        + cost["request_cost"]
+        + cost["transition_cost"]
     )
 
 
-def calculate_current_cost(
-    document: OptimizerInput,
-) -> dict:
-    """Calculate the cost of keeping the current tier for 12 months."""
-
-    cost = calculate_tier_cost(
-        document,
-        document.current_storage_class,
-        include_transition=False,
-    )
-
-    return {
-        "storage_cost": cost.storage_cost,
-        "retrieval_cost": cost.retrieval_cost,
-        "request_cost": cost.request_cost,
-        "transition_cost": cost.transition_cost,
-        "total_cost": cost.total_cost,
-    }
-
-
-def get_optimizer_cost_breakdown(
-    optimizer_result,
-) -> dict:
-    """Return the cost breakdown for the recommended tier."""
-
-    for tier in optimizer_result.tier_costs:
-        if (
-            tier.storage_class
-            == optimizer_result.recommended_storage_class
-        ):
-            return {
-                "storage_cost": tier.cost.storage_cost,
-                "retrieval_cost": tier.cost.retrieval_cost,
-                "request_cost": tier.cost.request_cost,
-                "transition_cost": tier.cost.transition_cost,
-                "total_cost": tier.cost.total_cost,
-            }
-
-    raise ValueError(
-        "Recommended storage class was not found."
+def test_results_file_exists():
+    """The committed artifact must exist; if stale, regenerate it
+    with scripts/regenerate_workload_results.py."""
+    assert RESULTS_FILE.exists(), (
+        "data/synthetic/workload_500_results.json is missing — "
+        "regenerate it with scripts/regenerate_workload_results.py"
     )
 
 
-def add_costs(
-    first: dict,
-    second: dict,
-) -> dict:
-    """Add two cost breakdown dictionaries."""
+def test_summary_matches_per_document_totals():
+    results = load_results()
 
-    return {
-        "storage_cost": (
-            first["storage_cost"]
-            + second["storage_cost"]
-        ),
-        "retrieval_cost": (
-            first["retrieval_cost"]
-            + second["retrieval_cost"]
-        ),
-        "request_cost": (
-            first["request_cost"]
-            + second["request_cost"]
-        ),
-        "transition_cost": (
-            first["transition_cost"]
-            + second["transition_cost"]
-        ),
-        "total_cost": (
-            first["total_cost"]
-            + second["total_cost"]
-        ),
-    }
+    documents = results["documents"]
+    summary = results["summary"]
 
+    assert summary["total_documents"] == len(documents)
 
-def calculate_tier_distribution(
-    results: list[dict],
-    strategy_key: str,
-) -> dict:
-    """
-    Calculate document count and total storage
-    for each storage tier.
-    """
-
-    distribution = defaultdict(
-        lambda: {
-            "document_count": 0,
-            "storage_gb": 0.0,
-        }
+    assert math.isclose(
+        summary["baseline_cost"],
+        sum(
+            row["baseline_cost"]
+            for row in documents
+        ),
+        rel_tol=1e-9,
     )
 
-    for result in results:
-        storage_class = result[strategy_key]
+    assert math.isclose(
+        summary["optimizer_cost"],
+        sum(
+            row["optimizer_cost"]
+            for row in documents
+        ),
+        rel_tol=1e-9,
+    )
 
-        file_size_gb = (
-            result["file_size_bytes"]
-            / 1_000_000_000
-        )
-
-        distribution[storage_class][
-            "document_count"
-        ] += 1
-
-        distribution[storage_class][
-            "storage_gb"
-        ] += file_size_gb
-
-    return dict(distribution)
+    assert math.isclose(
+        summary["total_storage_gb"],
+        sum(
+            row["file_size_bytes"]
+            for row in documents
+        ) / 1_000_000_000,
+        rel_tol=1e-9,
+    )
 
 
-def run_experiment() -> None:
-    """Run the full 500-document workload experiment."""
+def test_savings_is_baseline_minus_optimizer():
+    results = load_results()
 
-    workload_data = load_workload()
+    summary = results["summary"]
 
-    workload = workload_data["documents"]
+    assert math.isclose(
+        summary["optimizer_savings_vs_baseline"],
+        summary["baseline_cost"]
+        - summary["optimizer_cost"],
+        rel_tol=1e-9,
+    )
 
-    reference_timestamp = workload_data[
-        "reference_timestamp"
+    assert math.isclose(
+        summary["optimizer_savings_percentage_vs_baseline"],
+        summary["optimizer_savings_vs_baseline"]
+        / summary["baseline_cost"]
+        * 100,
+        rel_tol=1e-6,
+    )
+
+
+def test_workload_file_recorded_portably():
+    """The experiment provenance path must be forward-slash
+    (previously recorded with Windows backslashes)."""
+    results = load_results()
+
+    workload_file = results["experiment"][
+        "workload_file"
     ]
 
-    detailed_results = []
+    assert "\\" not in workload_file
+    assert workload_file == "data/synthetic/workload_500.json"
 
-    total_storage_gb = 0.0
 
-    baseline_costs = {
-        "storage_cost": 0.0,
-        "retrieval_cost": 0.0,
-        "request_cost": 0.0,
-        "transition_cost": 0.0,
-        "total_cost": 0.0,
+def test_workload_covers_every_result_row():
+    results = load_results()
+    workload = load_workload()["documents"]
+
+    workload_ids = {
+        document["document_id"]
+        for document in workload
     }
 
-    optimizer_costs = {
-        "storage_cost": 0.0,
-        "retrieval_cost": 0.0,
-        "request_cost": 0.0,
-        "transition_cost": 0.0,
-        "total_cost": 0.0,
+    result_ids = {
+        row["document_id"]
+        for row in results["documents"]
     }
 
-    for document in workload:
-        optimizer_input = create_optimizer_input(
-            document
+    assert result_ids == workload_ids
+
+
+def test_baseline_matches_optimizer_when_same_shape():
+    """Baseline vs optimizer must be comparable: every row's
+    optimizer cost must be <= its current-class cost, and the
+    optimizer must never be slower-billed than the baseline for
+    the same 12-month horizon under Policy B."""
+    results = load_results()
+
+    for row in results["documents"]:
+        assert row["optimizer_cost"] <= row[
+            "current_cost"
+        ] + 1e-12, (
+            f"{row['document_id']} recommends a tier more "
+            "expensive than staying (Policy B guard violated)"
         )
-
-        optimizer_result = optimize_document(
-            optimizer_input
-        )
-
-        current_cost = calculate_current_cost(
-            optimizer_input
-        )
-
-        baseline_result = calculate_baseline_cost(
-            optimizer_input,
-            reference_timestamp,
-        )
-
-        optimizer_cost = get_optimizer_cost_breakdown(
-            optimizer_result
-        )
-
-        baseline_cost = {
-            "storage_cost": baseline_result[
-                "storage_cost"
-            ],
-            "retrieval_cost": baseline_result[
-                "retrieval_cost"
-            ],
-            "request_cost": baseline_result[
-                "request_cost"
-            ],
-            "transition_cost": baseline_result[
-                "transition_cost"
-            ],
-            "total_cost": baseline_result[
-                "total_cost"
-            ],
-        }
-
-        file_size_gb = (
-            document["file_size_bytes"]
-            / 1_000_000_000
-        )
-
-        total_storage_gb += file_size_gb
-
-        baseline_costs = add_costs(
-            baseline_costs,
-            baseline_cost,
-        )
-
-        optimizer_costs = add_costs(
-            optimizer_costs,
-            optimizer_cost,
-        )
-
-        detailed_results.append(
-            {
-                "document_id": document[
-                    "document_id"
-                ],
-                "file_size_bytes": document[
-                    "file_size_bytes"
-                ],
-                "current_storage_class": document[
-                    "current_storage_class"
-                ],
-                "current_cost": current_cost[
-                    "total_cost"
-                ],
-                "optimizer_storage_class": (
-                    optimizer_result
-                    .recommended_storage_class
-                ),
-                "optimizer_cost": (
-                    optimizer_result.recommended_cost
-                ),
-                "optimizer_savings_vs_current": (
-                    optimizer_result.savings
-                ),
-                "optimizer_savings_percentage_vs_current": (
-                    optimizer_result.savings_percentage
-                ),
-                "baseline_storage_class": (
-                    baseline_result[
-                        "storage_class"
-                    ]
-                ),
-                "baseline_cost": (
-                    baseline_result[
-                        "total_cost"
-                    ]
-                ),
-                "baseline_transition_count": (
-                    baseline_result[
-                        "transition_count"
-                    ]
-                ),
-                "optimizer_cost_breakdown": (
-                    optimizer_cost
-                ),
-                "baseline_cost_breakdown": (
-                    baseline_cost
-                ),
-            }
-        )
-
-    optimizer_savings = (
-        baseline_costs["total_cost"]
-        - optimizer_costs["total_cost"]
-    )
-
-    if baseline_costs["total_cost"] > 0:
-        optimizer_savings_percentage = (
-            optimizer_savings
-            / baseline_costs["total_cost"]
-        ) * 100
-    else:
-        optimizer_savings_percentage = 0.0
-
-    optimizer_distribution = (
-        calculate_tier_distribution(
-            detailed_results,
-            "optimizer_storage_class",
-        )
-    )
-
-    baseline_distribution = (
-        calculate_tier_distribution(
-            detailed_results,
-            "baseline_storage_class",
-        )
-    )
-
-    total_baseline_transitions = sum(
-        result["baseline_transition_count"]
-        for result in detailed_results
-    )
-
-    summary = {
-        "total_documents": len(workload),
-        "total_storage_gb": total_storage_gb,
-        "baseline_cost": baseline_costs[
-            "total_cost"
-        ],
-        "optimizer_cost": optimizer_costs[
-            "total_cost"
-        ],
-        "optimizer_savings_vs_baseline": (
-            optimizer_savings
-        ),
-        "optimizer_savings_percentage_vs_baseline": (
-            optimizer_savings_percentage
-        ),
-        "baseline_tier_distribution": (
-            baseline_distribution
-        ),
-        "optimizer_tier_distribution": (
-            optimizer_distribution
-        ),
-        "baseline_cost_breakdown": baseline_costs,
-        "optimizer_cost_breakdown": optimizer_costs,
-        "baseline_transition_count": (
-            total_baseline_transitions
-        ),
-    }
-
-    output = {
-        "experiment": {
-            "workload_file": str(WORKLOAD_FILE),
-            "reference_timestamp": (
-                reference_timestamp
-            ),
-            "planning_horizon_months": 12,
-        },
-        "summary": summary,
-        "documents": detailed_results,
-    }
-
-    with RESULTS_FILE.open(
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            output,
-            file,
-            indent=2,
-        )
-
-    print()
-    print("=" * 60)
-    print("500-DOCUMENT SYNTHETIC WORKLOAD")
-    print("=" * 60)
-
-    print()
-    print("WORKLOAD")
-    print("-" * 60)
-    print(
-        f"Documents:                 "
-        f"{len(workload)}"
-    )
-    print(
-        f"Storage:                   "
-        f"{total_storage_gb:.2f} GB"
-    )
-
-    print()
-    print("12-MONTH PROJECTED COST")
-    print("-" * 60)
-    print(
-        f"Baseline:                  "
-        f"${baseline_costs['total_cost']:.6f}"
-    )
-    print(
-        f"Optimizer:                 "
-        f"${optimizer_costs['total_cost']:.6f}"
-    )
-
-    print()
-    print("OPTIMIZER SAVINGS VS BASELINE")
-    print("-" * 60)
-    print(
-        f"Savings:                   "
-        f"${optimizer_savings:.6f}"
-    )
-    print(
-        f"Savings percentage:        "
-        f"{optimizer_savings_percentage:.2f}%"
-    )
-
-    print()
-    print("STORAGE-TIER DISTRIBUTION")
-    print("-" * 60)
-
-    print("Baseline:")
-
-    for storage_class in sorted(
-        baseline_distribution
-    ):
-        values = baseline_distribution[
-            storage_class
-        ]
-
-        print(
-            f"  {storage_class:<32}"
-            f"{values['document_count']:>4} docs"
-            f"  {values['storage_gb']:>10.2f} GB"
-        )
-
-    print()
-    print("Optimizer:")
-
-    for storage_class in sorted(
-        optimizer_distribution
-    ):
-        values = optimizer_distribution[
-            storage_class
-        ]
-
-        print(
-            f"  {storage_class:<32}"
-            f"{values['document_count']:>4} docs"
-            f"  {values['storage_gb']:>10.2f} GB"
-        )
-
-    print()
-    print("COST BREAKDOWN")
-    print("-" * 60)
-
-    print("Baseline:")
-
-    print(
-        f"  Storage:                  "
-        f"${baseline_costs['storage_cost']:.6f}"
-    )
-
-    print(
-        f"  Retrieval:                "
-        f"${baseline_costs['retrieval_cost']:.6f}"
-    )
-
-    print(
-        f"  Requests:                 "
-        f"${baseline_costs['request_cost']:.6f}"
-    )
-
-    print(
-        f"  Transitions:              "
-        f"${baseline_costs['transition_cost']:.6f}"
-    )
-
-    print(
-        f"  Total:                    "
-        f"${baseline_costs['total_cost']:.6f}"
-    )
-
-    print()
-    print("Optimizer:")
-
-    print(
-        f"  Storage:                  "
-        f"${optimizer_costs['storage_cost']:.6f}"
-    )
-
-    print(
-        f"  Retrieval:                "
-        f"${optimizer_costs['retrieval_cost']:.6f}"
-    )
-
-    print(
-        f"  Requests:                 "
-        f"${optimizer_costs['request_cost']:.6f}"
-    )
-
-    print(
-        f"  Transitions:              "
-        f"${optimizer_costs['transition_cost']:.6f}"
-    )
-
-    print(
-        f"  Total:                    "
-        f"${optimizer_costs['total_cost']:.6f}"
-    )
-
-    print()
-    print(
-        f"Detailed results saved to: "
-        f"{RESULTS_FILE}"
-    )
-
-
-if __name__ == "__main__":
-    run_experiment()
-

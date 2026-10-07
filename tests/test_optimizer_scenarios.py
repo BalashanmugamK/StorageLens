@@ -34,8 +34,8 @@ SCENARIOS = [
         "access_count": 5,
         "current": "STANDARD",
         "upload_timestamp": "2026-08-01T00:00:00Z",
-        "expected_recommendation": "STANDARD",
-        "expected_verdict": "NO CHANGE",
+        "expected_recommendation": "INTELLIGENT_TIERING",
+        "expected_verdict": "POSITIVE SAVINGS",
     },
     {
         "name": "3. Rarely accessed CLOSED document",
@@ -61,7 +61,7 @@ SCENARIOS = [
         "access_count": 30,
         "current": "GLACIER_DEEP_ARCHIVE",
         "upload_timestamp": "2026-01-01T00:00:00Z",
-        "expected_recommendation": "GLACIER_FLEXIBLE_RETRIEVAL",
+        "expected_recommendation": "INTELLIGENT_TIERING",
         "expected_verdict": "POSITIVE SAVINGS",
     },
 ]

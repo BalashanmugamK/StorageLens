@@ -15,6 +15,8 @@ and never writes unless --write is passed:
 Refreshed from the API (per region):
   - storage_per_gb_month   first usage bracket (first 50 TB),
                            usagetype TimedStorage-* lines
+  - IT layer rates          TimedStorage-INT-{FA,IA,AIA}-ByteHrs
+  - IT monitoring fee       Monitoring-Automation-INT (per object)
   - get_request_per_1000   GET request lines (Tier2)
   - retrieval_request_per_1000  restore-request line (Flexible)
   - retrieval_per_gb       SIA/GIR retrieval fees and archive
@@ -66,8 +68,28 @@ STORAGE_PATTERNS = {
     ),
 }
 
+# Intelligent-Tiering bills one blended rate across its FA/IA
+# AIA layers (see optimization/costs.py); refresh each layer's
+# first usage bracket (first 50 TB). The Tables- prefixed lines
+# (S3 Tables) share the suffix but carry different rates, so the
+# anchor must reject them.
+IT_STORAGE_PATTERNS = {
+    "storage_per_gb_month_frequent": (
+        r"^(?:[A-Z0-9]{2,6}-)?TimedStorage-INT-FA-ByteHrs$"
+    ),
+    "storage_per_gb_month_infrequent": (
+        r"^(?:[A-Z0-9]{2,6}-)?TimedStorage-INT-IA-ByteHrs$"
+    ),
+    "storage_per_gb_month_archive_instant": (
+        r"^(?:[A-Z0-9]{2,6}-)?TimedStorage-INT-AIA-ByteHrs$"
+    ),
+}
+
 GET_PATTERNS = {
     "STANDARD": r"^(?:[A-Z0-9]{2,6}-)?Requests-Tier2$",
+    "INTELLIGENT_TIERING": (
+        r"^(?:[A-Z0-9]{2,6}-)?Requests-INT-Tier2$"
+    ),
     "STANDARD_IA": r"-Requests-SIA-Tier2$",
     "GLACIER_INSTANT_RETRIEVAL": r"-Requests-GIR-Tier2$",
     "GLACIER_FLEXIBLE_RETRIEVAL": r"-Requests-GLACIER-Tier2$",
@@ -75,6 +97,7 @@ GET_PATTERNS = {
 }
 
 TRANSITION_OPERATIONS = {
+    "S3-INTTransition": "INTELLIGENT_TIERING",
     "S3-SIATransition": "STANDARD_IA",
     "S3-GIRTransition": "GLACIER_INSTANT_RETRIEVAL",
     "S3-GlacierTransition": "GLACIER_FLEXIBLE_RETRIEVAL",
@@ -210,7 +233,7 @@ def first_bracket_rate(rates, pattern):
     return min(candidates)
 
 
-def per_1000_rate(rates, pattern, operation=None):
+def per_1000_rate(rates, pattern, operation=None, unit="Requests"):
     """
     Convert a per-unit request rate into its per-1,000 value.
     """
@@ -221,7 +244,7 @@ def per_1000_rate(rates, pattern, operation=None):
         if not regex.search(r["usagetype"]):
             continue
 
-        if r["unit"] != "Requests":
+        if r["unit"] != unit:
             continue
 
         if operation and r["operation"] != operation:
@@ -308,6 +331,38 @@ def build_fresh_rates(boto3, region):
             "get_request_per_1000"
         ] = rate
 
+    for field, pattern in IT_STORAGE_PATTERNS.items():
+        rate = first_bracket_rate(rates, pattern)
+
+        if rate is None:
+            unmatched.append(
+                f"{field}/INTELLIGENT_TIERING"
+            )
+
+        refreshed.setdefault(
+            "INTELLIGENT_TIERING", {}
+        )[field] = rate
+
+    # The monitoring/automation fee is published per object-
+    # month; convert to the per-1,000 schema used by the model.
+    monitoring_rate = per_1000_rate(
+        rates,
+        r"^(?:[A-Z0-9]{2,6}-)?Monitoring-Automation-INT$",
+        unit="Objects",
+    )
+
+    if monitoring_rate is None:
+        unmatched.append(
+            "monitoring_automation_fee_per_1000_object_month"
+            "/INTELLIGENT_TIERING"
+        )
+
+    refreshed.setdefault(
+        "INTELLIGENT_TIERING", {}
+    )[
+        "monitoring_automation_fee_per_1000_object_month"
+    ] = monitoring_rate
+
     for operation, storage_class in (
         TRANSITION_OPERATIONS.items()
     ):
@@ -391,8 +446,8 @@ def main():
         "--region",
         default=None,
         help=(
-            "Target region; defaults to the pricing.json "
-            "region (ap-south-1)."
+            "Target region; defaults to the region already in "
+            "pricing.json."
         ),
     )
 
@@ -415,6 +470,10 @@ def main():
         "get_request_per_1000",
         "transition_per_1000",
         "retrieval_per_gb",
+        "storage_per_gb_month_frequent",
+        "storage_per_gb_month_infrequent",
+        "storage_per_gb_month_archive_instant",
+        "monitoring_automation_fee_per_1000_object_month",
     ]
 
     changes = []

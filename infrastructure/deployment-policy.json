@@ -1,5 +1,5 @@
 {
-  "_description": "LEAST-PRIVILEGE DEPLOYMENT IDENTITY POLICY for this repository. Review artifact only: an AWS administrator must substitute the placeholders and attach it manually. This repository's tooling NEVER modifies IAM automatically. Placeholders: {{ACCOUNT_ID}} = 12-digit target account id, {{REGION}} = the target deployment region, {{STACK_NAME}} = the samconfig.toml stack_name. Scope notes: (1) CloudFormation generated physical names start with the stack name, so every template resource is scoped to '<stack name>-*' patterns; S3 bucket names are lowercased accordingly. (2) 'aws-sam-cli-managed-*' is the documented prefix of the SAM CLI's code-artifact deployment bucket (samconfig has resolve_s3 = true). (3) Both functions have no explicit Role property, so CloudFormation creates and manages the execution roles - hence the iam: role-management actions; iam:PassRole is deliberately absent because CloudFormation creates these roles inside the same stack and binds them itself. (4) No wildcard-only actions/resources are used. Review with IAM Access Analyzer before attaching; a passing preflight (scripts/check_deployment_permissions.py) is evidence, not a guarantee - SCPs, session policies, and resource policies are outside its scope.",
+  "_description": "LEAST-PRIVILEGE DEPLOYMENT IDENTITY POLICY for this repository. Review artifact only: an AWS administrator must substitute the placeholders and attach it manually. This repository's tooling NEVER modifies IAM automatically. Placeholders: {{ACCOUNT_ID}} = 12-digit target account id, {{REGION}} = the target deployment region, {{STACK_NAME}} = the samconfig.toml stack_name. Scope notes: (1) CloudFormation generated physical names start with the stack name, so every template resource is scoped to '<stack name>-*' patterns; S3 bucket names are lowercased accordingly. (2) 'aws-sam-cli-managed-*' is the documented prefix of the SAM CLI's code-artifact deployment bucket (samconfig has resolve_s3 = true). (3) Both functions have no explicit Role property, so CloudFormation creates and manages the execution roles - hence the iam: role-management actions; iam:PassRole is deliberately absent because CloudFormation creates these roles inside the same stack and binds them itself. (4) One documented wildcard-resource exception: logs:PutResourcePolicy (LogsAccountLevelResourcePolicy statement) has no resource-level permission support in IAM, so it must carry Resource \"*\". Review with IAM Access Analyzer before attaching; a passing preflight (scripts/check_deployment_permissions.py) is evidence, not a guarantee - SCPs, session policies, and resource policies are outside its scope.",
   "Version": "2012-10-17",
   "Statement": [
     {
@@ -111,9 +111,115 @@
         "apigatewayv2:UpdateIntegration",
         "apigatewayv2:CreateRoute",
         "apigatewayv2:GetRoute",
-        "apigatewayv2:UpdateRoute"
+        "apigatewayv2:UpdateRoute",
+        "apigatewayv2:CreateAuthorizer",
+        "apigatewayv2:GetAuthorizer",
+        "apigatewayv2:UpdateAuthorizer",
+        "apigatewayv2:DeleteAuthorizer"
       ],
       "Resource": ["arn:aws:apigateway:{{REGION}}::/apis*"]
+    },
+    {
+      "Sid": "TemplateCognitoUserPools",
+      "Effect": "Allow",
+      "Action": [
+        "cognito-idp:CreateUserPool",
+        "cognito-idp:DescribeUserPool",
+        "cognito-idp:UpdateUserPool",
+        "cognito-idp:DeleteUserPool",
+        "cognito-idp:TagResource",
+        "cognito-idp:UntagResource",
+        "cognito-idp:CreateUserPoolClient",
+        "cognito-idp:DescribeUserPoolClient",
+        "cognito-idp:UpdateUserPoolClient",
+        "cognito-idp:DeleteUserPoolClient",
+        "cognito-idp:CreateUserPoolDomain",
+        "cognito-idp:DescribeUserPoolDomain",
+        "cognito-idp:DeleteUserPoolDomain"
+      ],
+      "Resource": [
+        "arn:aws:cognito-idp:{{REGION}}:{{ACCOUNT_ID}}:userpool/{{REGION}}_*"
+      ],
+      "_scope_note": "Cognito user pool IDs are server-generated (region_ + random suffix), so the pool resource type cannot be scoped narrower than this region-prefix wildcard. This is a wildcard within one resource type and one account/region, NOT a global Resource '*' - user pool creation, its app client and its hosted-UI domain all live under this ARN pattern."
+    },
+    {
+      "Sid": "TemplateAlarmsTopic",
+      "Effect": "Allow",
+      "Action": [
+        "sns:CreateTopic",
+        "sns:GetTopicAttributes",
+        "sns:SetTopicAttributes",
+        "sns:Subscribe",
+        "sns:DeleteTopic",
+        "sns:TagResource"
+      ],
+      "Resource": [
+        "arn:aws:sns:{{REGION}}:{{ACCOUNT_ID}}:{{STACK_NAME}}-alarms"
+      ]
+    },
+    {
+      "Sid": "TemplateCloudWatchAlarms",
+      "Effect": "Allow",
+      "Action": [
+        "cloudwatch:PutMetricAlarm",
+        "cloudwatch:DescribeAlarms",
+        "cloudwatch:DeleteAlarms"
+      ],
+      "Resource": [
+        "arn:aws:cloudwatch:{{REGION}}:{{ACCOUNT_ID}}:alarm/{{STACK_NAME}}-*"
+      ]
+    },
+    {
+      "Sid": "TemplateLogGroups",
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogGroup",
+        "logs:PutRetentionPolicy",
+        "logs:DeleteLogGroup"
+      ],
+      "Resource": [
+        "arn:aws:logs:{{REGION}}:{{ACCOUNT_ID}}:log-group:/aws/lambda/{{STACK_NAME}}-*",
+        "arn:aws:logs:{{REGION}}:{{ACCOUNT_ID}}:log-group:/aws/apigateway/{{STACK_NAME}}/*"
+      ]
+    },
+    {
+      "Sid": "TemplatePagerDutySecret",
+      "Effect": "Allow",
+      "Action": [
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:TagResource",
+        "secretsmanager:DeleteSecret"
+      ],
+      "Resource": [
+        "arn:aws:secretsmanager:{{REGION}}:{{ACCOUNT_ID}}:secret:{{STACK_NAME}}-pagerduty*",
+        "arn:aws:secretsmanager:{{REGION}}:{{ACCOUNT_ID}}:secret:{{STACK_NAME}}-pagerduty*-*"
+      ],
+      "_scope_note": "Secret secret-name ARNs carry a server-generated suffix after a second dash, so both the exact-name prefix and the suffixed form are listed. Value-filling the secret (put-secret-value) is deliberately OUT of this deployment identity: it is an operator action done with a normal admin credential post-deploy, which keeps the deployment role read-only with respect to PagerDuty credentials."
+    },
+    {
+      "Sid": "TemplateEventBridgeSchedules",
+      "Effect": "Allow",
+      "Action": [
+        "events:PutRule",
+        "events:DescribeRule",
+        "events:PutTargets",
+        "events:DeleteTargets",
+        "events:DeleteRule",
+        "events:EnableRule",
+        "events:DisableRule"
+      ],
+      "Resource": [
+        "arn:aws:events:{{REGION}}:{{ACCOUNT_ID}}:rule/{{STACK_NAME}}*"
+      ]
+    },
+    {
+      "Sid": "LogsAccountLevelResourcePolicy",
+      "Effect": "Allow",
+      "Action": ["logs:PutResourcePolicy"],
+      "Resource": ["*"],
+      "_exception_note": "The ONE wildcard resource in this policy: logs:PutResourcePolicy has no resource-level permission support in IAM (a log-group ARN would grant nothing). It is required only because the template grants API Gateway write access to the API access-log group via AWS::Logs::ResourcePolicy."
     }
   ]
 }

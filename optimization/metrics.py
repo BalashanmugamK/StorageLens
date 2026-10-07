@@ -1,3 +1,4 @@
+from .costs import calculate_tier_cost
 from .models import OptimizerInput, OptimizationResult, WorkloadSummary
 
 
@@ -32,7 +33,7 @@ def calculate_workload_summary(
     current_tier_distribution = {}
     recommended_tier_distribution = {}
 
-    for result in results:
+    for document, result in zip(documents, results):
         current_cost += result.current_cost
         optimized_cost += result.recommended_cost
 
@@ -65,12 +66,29 @@ def calculate_workload_summary(
         if getattr(result, "policy_conflict", False):
             policy_conflict_count += 1
 
-        for tier in result.tier_costs:
-            if tier.storage_class == result.current_storage_class:
-                current_retrieval_cost += (
-                    tier.cost.retrieval_cost
-                )
+        # Under Policy A the current class is not state-eligible
+        # and may be missing from tier_costs entirely, so the
+        # current-class economics are re-derived from the cost
+        # model instead of silently reporting 0.
+        current_breakdown = next(
+            (
+                tier.cost
+                for tier in result.tier_costs
+                if tier.storage_class
+                == result.current_storage_class
+            ),
+            calculate_tier_cost(
+                document,
+                result.current_storage_class,
+                include_transition=False,
+            ),
+        )
 
+        current_retrieval_cost += (
+            current_breakdown.retrieval_cost
+        )
+
+        for tier in result.tier_costs:
             if tier.storage_class == result.recommended_storage_class:
                 optimized_retrieval_cost += (
                     tier.cost.retrieval_cost

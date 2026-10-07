@@ -162,10 +162,27 @@ def test_template_requirements_come_from_properties():
     assert "dynamodb:CreateTable" in actions
     assert "lambda:AddPermission" in actions
     assert "apigatewayv2:CreateApi" in actions
+    # The hardened template adds alarms/log-retention infrastructure:
+    assert "sns:CreateTopic" in actions
+    assert "cloudwatch:PutMetricAlarm" in actions
+    assert "logs:CreateLogGroup" in actions
+    assert "logs:PutRetentionPolicy" in actions
+    assert "logs:PutResourcePolicy" in actions
 
     # NOT triggered by anything in this template:
     assert "lambda:CreateEventSourceMapping" not in actions
-    assert "apigatewayv2:CreateAuthorizer" not in actions
+    # The hardened template now uses a JWT authorizer on the HTTP API.
+    assert "apigatewayv2:CreateAuthorizer" in actions
+
+    cognito_actions = {
+        action
+        for action in actions
+        if action.startswith("cognito-idp:")
+    }
+
+    assert "cognito-idp:CreateUserPool" in cognito_actions
+    assert "cognito-idp:CreateUserPoolClient" in cognito_actions
+    assert "cognito-idp:CreateUserPoolDomain" in cognito_actions
 
 
 def test_managed_bucket_requirements_follow_resolve_s3():
@@ -187,6 +204,12 @@ def test_category_b_runtime_grants_kept_separate():
     assert set(grants) == {
         "DocumentsFunctionRole",
         "AggregatesFunctionRole",
+        "DecisionsFunctionRole",
+        "IngestFunctionRole",
+        # Reconciliation reads Cost Explorer + two tables and writes
+        # one — also a runtime role, also never a Category B act.
+        "ReconciliationFunctionRole",
+        "OnCallFunctionRole",
     }
 
     document_actions = {
@@ -197,6 +220,30 @@ def test_category_b_runtime_grants_kept_separate():
 
     assert "dynamodb:PutItem" in document_actions
     assert "iam:CreateRole" not in document_actions
+
+    # The ingest role stays read-only against S3 and write-scoped to
+    # the two tables — no bucket creation, no IAM.
+    ingest_actions = {
+        action
+        for grant in grants["IngestFunctionRole"]
+        for action in grant["actions"]
+    }
+    assert "s3:GetObject" in ingest_actions
+    assert "dynamodb:PutItem" in ingest_actions
+    assert "s3:CreateBucket" not in ingest_actions
+    assert "iam:CreateRole" not in ingest_actions
+
+    # The reconciliation role reads billing data and the fleet, then
+    # writes one report table — no write access to documents, no IAM.
+    reconciliation_actions = {
+        action
+        for grant in grants["ReconciliationFunctionRole"]
+        for action in grant["actions"]
+    }
+    assert "ce:GetCostAndUsage" in reconciliation_actions
+    assert "dynamodb:PutItem" in reconciliation_actions
+    assert "dynamodb:DeleteItem" not in reconciliation_actions
+    assert "iam:CreateRole" not in reconciliation_actions
 
     # Category B actions must not appear as deployment requirements.
     requirements = preflight.extract_deployment_requirements(
@@ -218,6 +265,14 @@ def test_scope_map_is_runtime_and_prefix_scoped():
     assert (
         scopes["TEMPLATE_BUCKET"]
         == "arn:aws:s3:::my-stack-*"
+    )
+    # Cognito pool ids are server-generated, so the scope can only
+    # carry the region prefix (a wildcard within the pool resource
+    # type - the policy artifact documents it separately from the
+    # single Resource "*" logs exception).
+    assert scopes["COGNITO_USERPOOLS"] == (
+        "arn:aws:cognito-idp:eu-west-3:222211114444"
+        ":userpool/eu-west-3_*"
     )
     assert scopes["SAM_MANAGED_BUCKET"] == [
         "arn:aws:s3:::aws-sam-cli-managed-*",
@@ -409,19 +464,33 @@ def test_policy_artifact_is_valid_json_and_scoped():
 
     assert document["Version"] == "2012-10-17"
 
+    # The single wildcard-resource exception: logs:PutResourcePolicy
+    # has no resource-level permission support in IAM (see the
+    # artifact's _exception_note and the LOGS_ACCOUNT scope note in
+    # check_deployment_permissions.py).
+    WILDCARD_RESOURCE_EXCEPTIONS = {"logs:PutResourcePolicy"}
+
     for statement in document["Statement"]:
         assert statement["Effect"] == "Allow"
 
         # No wildcard-everything anywhere - documented exceptions
         # would need to live next to this assertion.
         assert statement["Action"] != "*"
-        assert statement["Resource"] != "*"
 
-        for action in statement["Action"]:
+        actions = statement["Action"]
+
+        wildcard_resource = "*" in statement["Resource"]
+
+        if wildcard_resource:
+            assert set(actions).issubset(
+                WILDCARD_RESOURCE_EXCEPTIONS
+            ), f"undeclared wildcard resource for {actions}"
+        else:
+            for resource in statement["Resource"]:
+                assert resource != "*"
+
+        for action in actions:
             assert action != "*"
-
-        for resource in statement["Resource"]:
-            assert resource != "*"
 
     actions = {
         action
@@ -548,3 +617,117 @@ def test_repo_sources_are_portable():
         assert "/Users/" not in text and "/home/" not in text, (
             f"machine path in {path}"
         )
+
+
+# ---------------------------------------------------------------
+# On-call + PagerDuty: secret secret, SNS subscriber, schedules
+# ---------------------------------------------------------------
+
+def test_oncall_function_runtime_grants():
+    template = preflight.parse_template()
+    grants = preflight.extract_runtime_grants(template)
+
+    oncall_actions = {
+        action
+        for grant in grants["OnCallFunctionRole"]
+        for action in grant["actions"]
+    }
+
+    assert "dynamodb:PutItem" in oncall_actions
+    assert "dynamodb:Query" in oncall_actions
+    assert "secretsmanager:GetSecretValue" in oncall_actions
+
+    # Deployment identity territory: the runtime role must not be
+    # able to mint, overwrite or delete secrets or tables.
+    assert "secretsmanager:PutSecretValue" not in oncall_actions
+    assert "secretsmanager:CreateSecret" not in oncall_actions
+    assert "dynamodb:DeleteTable" not in oncall_actions
+    assert "iam:CreateRole" not in oncall_actions
+
+
+def test_oncall_deployment_requirements_detected():
+    template = preflight.parse_template()
+
+    requirements = {
+        (item.action, item.scope)
+        for item in preflight.extract_deployment_requirements(template)
+    }
+
+    # The empty PagerDuty secret's lifecycle.
+    for action in (
+        "secretsmanager:CreateSecret",
+        "secretsmanager:DescribeSecret",
+        "secretsmanager:UpdateSecret",
+        "secretsmanager:TagResource",
+        "secretsmanager:DeleteSecret",
+    ):
+        assert (action, "PD_SECRET") in requirements, action
+
+    # Every function with a Schedule event contributes the
+    # EventBridge rule lifecycle (the on-call reconciler joins the
+    # aggregates/reconciliation schedules).
+    for action in (
+        "events:PutRule",
+        "events:DescribeRule",
+        "events:PutTargets",
+        "events:DeleteTargets",
+        "events:DeleteRule",
+        "events:EnableRule",
+        "events:DisableRule",
+    ):
+        assert (action, "EVENTBRIDGE_SCHEDULES") in requirements, action
+
+    # The on-call function's SNS event subscribes it to alarms topic.
+    assert ("sns:Subscribe", "SNS_TOPICS") in requirements
+
+
+def test_new_scopes_are_narrow():
+    scopes = preflight.build_scope_map(
+        "MyStack", "eu-west-3", "222211114444"
+    )
+
+    # Both Secrets Manager ARN forms: the bare name prefix and the
+    # suffixed form with the server-generated suffix separator.
+    assert scopes["PD_SECRET"] == [
+        "arn:aws:secretsmanager:eu-west-3:222211114444"
+        ":secret:mystack-pagerduty*",
+        "arn:aws:secretsmanager:eu-west-3:222211114444"
+        ":secret:mystack-pagerduty*-*",
+    ]
+    assert scopes["EVENTBRIDGE_SCHEDULES"] == (
+        "arn:aws:events:eu-west-3:222211114444:rule/mystack*"
+    )
+
+    assert preflight.scope_label("PD_SECRET") == (
+        "PagerDuty credential secret"
+    )
+    assert preflight.scope_label("EVENTBRIDGE_SCHEDULES") == (
+        "EventBridge schedule rules"
+    )
+
+
+def test_rendered_policy_covers_the_new_scopes():
+    rendered = preflight.render_policy_document(
+        "SAMPLE_ACCOUNT", "sample-region", "sample-stack"
+    )
+
+    document = json.loads(rendered)
+
+    by_sid = {
+        statement["Sid"]: statement
+        for statement in document["Statement"]
+    }
+
+    secret_statement = by_sid["TemplatePagerDutySecret"]
+
+    assert "secretsmanager:CreateSecret" in secret_statement["Action"]
+    assert "secretsmanager:DeleteSecret" in secret_statement["Action"]
+    # The value-filling action deliberately stays with the operator.
+    assert "secretsmanager:PutSecretValue" not in (
+        secret_statement["Action"]
+    )
+
+    schedule_statement = by_sid["TemplateEventBridgeSchedules"]
+
+    assert "events:PutRule" in schedule_statement["Action"]
+    assert "events:PutTargets" in schedule_statement["Action"]

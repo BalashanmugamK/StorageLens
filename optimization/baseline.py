@@ -1,6 +1,12 @@
 from datetime import datetime, timezone
 
-from .costs import load_pricing
+from .access import calculate_expected_annual_downloads
+from .costs import (
+    calculate_archive_overhead_cost,
+    calculate_billable_size_gb,
+    calculate_current_tier_early_deletion_fee,
+    load_pricing,
+)
 from .models import OptimizerInput
 
 
@@ -138,6 +144,13 @@ def calculate_baseline_cost(
 
     The baseline simulates lifecycle transitions across
     the full 12-month evaluation horizon.
+
+    The baseline is billed exactly like the optimizer's per-tier
+    model so the comparison is apples-to-apples: same billable
+    object sizes (minimum sizes + archived-object overhead), the
+    same recency-attenuated access forecast, and the same
+    early-deletion fee for migrating out of the current class
+    inside its minimum storage duration.
     """
 
     pricing = load_pricing()
@@ -156,13 +169,22 @@ def calculate_baseline_cost(
         horizon_days,
     )
 
-    file_size_gb = (
-        document.file_size_bytes / 1_000_000_000
-    )
+    recency = assumptions.get("recency_weighting", {})
 
+    # Same forecast the optimizer uses: 30-day frequency
+    # extrapolated to a year, attenuated by access recency.
     expected_annual_downloads = (
-        document.access_frequency
-        * assumptions["days_per_year"]
+        calculate_expected_annual_downloads(
+            document.access_frequency,
+            days_since_last_access=(
+                document.days_since_last_access
+            ),
+            recency_half_life_days=(
+                recency.get("half_life_days")
+                if recency.get("enabled", False)
+                else None
+            ),
+        )
     )
 
     total_storage_cost = 0.0
@@ -182,10 +204,24 @@ def calculate_baseline_cost(
             duration_days / DAYS_PER_MONTH
         )
 
+        # Billed on the tier's billable size (minimum size +
+        # the 32 KB archive-rate metadata overhead), exactly
+        # like the optimizer.
+        billable_gb = calculate_billable_size_gb(
+            tier,
+            document.file_size_bytes,
+        )
+
         storage_cost = (
-            file_size_gb
+            billable_gb
             * tier["storage_per_gb_month"]
             * duration_months
+        ) + calculate_archive_overhead_cost(
+            tier,
+            duration_months,
+            classes["STANDARD"][
+                "storage_per_gb_month"
+            ],
         )
 
         retrieval_fraction = (
@@ -199,7 +235,8 @@ def calculate_baseline_cost(
 
         retrieval_cost = (
             period_downloads
-            * file_size_gb
+            * document.file_size_bytes
+            / 1_000_000_000
             * tier["retrieval_per_gb"]
         )
 
@@ -242,9 +279,17 @@ def calculate_baseline_cost(
 
         destination_tier = classes[first_baseline_class]
 
+        # The initial migration out of the current class carries
+        # the same prorated early-deletion fee the optimizer
+        # charges for it (leaving a class inside its minimum
+        # storage duration is paid regardless of destination).
         total_transition_cost += (
             destination_tier["transition_per_1000"]
             / 1000
+            + calculate_current_tier_early_deletion_fee(
+                document,
+                pricing,
+            )
         )
 
     for index in range(1, len(periods)):

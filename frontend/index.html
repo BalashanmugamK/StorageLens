@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta
+      name="description"
+      content="StorageLens — intelligent cloud storage cost optimizer"
+    />
+    <title>StorageLens</title>
+    <script>
+      // Resolve the theme before first paint so the page never flashes
+      // the wrong palette. Mirrors the storagelens.* localStorage naming
+      // used by useLiveSystem; try/catch for private-mode browsers.
+      (function () {
+        var theme = null;
+        try {
+          theme = localStorage.getItem("storagelens.theme");
+        } catch (e) {}
+        if (theme !== "light" && theme !== "dark") {
+          theme =
+            window.matchMedia &&
+            window.matchMedia("(prefers-color-scheme: light)").matches
+              ? "light"
+              : "dark";
+        }
+        document.documentElement.setAttribute("data-theme", theme);
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -1,0 +1,9 @@
+# Local development / CI test dependencies.
+#
+# Nothing here is shipped to Lambda: the runtime handlers use only
+# boto3 (provided by the AWS Lambda Python 3.13 runtime). These pins
+# are what `pytest tests/` needs OUTSIDE the runtime.
+
+pytest~=9.1
+boto3~=1.43
+botocore~=1.43

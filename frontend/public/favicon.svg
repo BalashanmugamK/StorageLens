@@ -1,0 +1,8 @@
+<!-- StorageLens mark: stacked storage layers with one optimized slice. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <rect width="32" height="32" rx="7" fill="#0c1118"/>
+  <rect x="6" y="7"  width="20" height="4.6" rx="2.3" fill="#a9cdf4"/>
+  <rect x="6" y="13.7" width="20" height="4.6" rx="2.3" fill="#5a88dc"/>
+  <rect x="6" y="20.4" width="20" height="4.6" rx="2.3" fill="#2a4c93"/>
+  <rect x="6" y="20.4" width="11" height="4.6" rx="2.3" fill="#3ddc97"/>
+</svg>

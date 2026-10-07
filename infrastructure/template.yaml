@@ -3,7 +3,344 @@ Transform: AWS::Serverless-2016-10-31
 Description: >
   Intelligent Cloud Storage Cost Optimizer - Milestone 1 infrastructure
 
+Parameters:
+
+  AlarmEmail:
+    Type: String
+    Default: ""
+    Description: >
+      Optional email address subscribed to the alarms topic. Leave
+      empty to create the alarms without a subscriber.
+
+  FrontendOrigin:
+    Type: String
+    Default: "http://localhost:5173"
+    Description: >
+      Origin the StorageLens frontend is served from. It is the
+      callback/logout target of the Cognito hosted-UI sign-in flow,
+      the API's pinned CORS origin and the documents bucket's CORS
+      origin. Keep the localhost default until the frontend is hosted
+      (scripts/deploy_frontend.py), then redeploy once with
+      FrontendOrigin=https://<distribution>.cloudfront.net.
+
+  PagerDutyScheduleId:
+    Type: String
+    Default: ""
+    Description: >
+      PagerDuty schedule id the on-call rotation syncs into as
+      overrides. Leave empty to keep every sync as a recorded skip
+      (skipped_no_schedule); fill it in once the PagerDuty schedule
+      and API token exist. Acknowledgment/escalation itself is owned
+      by PagerDuty's escalation policy, not by this stack.
+
+Conditions:
+
+  HasAlarmEmail: !Not [!Equals [!Ref AlarmEmail, ""]]
+
 Resources:
+
+  # ---- Authentication -------------------------------------------------
+  #
+  # Every API route except GET /config sits behind a Cognito JWT
+  # authorizer. Sign-in uses the hosted UI (authorization-code +
+  # PKCE, no client secret in the browser); the frontend exchanges
+  # the code at /oauth2/token directly, so no auth SDK is needed.
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub "${AWS::StackName}-users"
+      AutoVerifiedAttributes: [email]
+      UsernameAttributes: [email]
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireUppercase: true
+          RequireNumbers: true
+      # Sign-up is ADMIN-ONLY: no self-registration means no anonymous
+      # account can ever reach the API; the operator creates users with
+      # admin-create-user and places approvers in the Approvers group.
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  # The RBAC split the decisions Lambda enforces: members of Approvers
+  # may approve/reject/execute and run batch proposals; everyone else
+  # (Users) can read, propose single decisions and run the pipeline.
+  ApproversGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Approvers
+      Description: May approve/reject/execute decisions and propose batches
+      Precedence: 1
+
+  UsersGroup:
+    Type: AWS::Cognito::UserPoolGroup
+    Properties:
+      UserPoolId: !Ref UserPool
+      GroupName: Users
+      Description: Default role - read the fleet, propose single decisions
+      Precedence: 10
+
+  # No GenerateSecret: browser SPAs cannot hold a client secret.
+  SpaClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub "${AWS::StackName}-spa"
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      # CFN validity defaults: 1 hour access/id tokens, 30 days for
+      # the refresh token.
+      AllowedOAuthFlowsUserPoolClient: true
+      AllowedOAuthFlows: [code]
+      AllowedOAuthScopes: [openid, email]
+      SupportedIdentityProviders: [COGNITO]
+      CallbackURLs:
+        - !Sub "${FrontendOrigin}/auth/callback"
+      LogoutURLs:
+        - !Sub "${FrontendOrigin}/"
+
+  # The hosted-UI domain must be globally unique across all AWS
+  # customers (~63 lowercase chars: lowercase alphanumeric with
+  # dashes); the stack name supplies the prefix. If the name is
+  # taken, rename the stack in samconfig.toml and redeploy.
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Sub "${AWS::StackName}-auth"
+      UserPoolId: !Ref UserPool
+
+  AlarmsTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-alarms"
+      Subscription:
+        - !If
+          - HasAlarmEmail
+          - Endpoint: !Ref AlarmEmail
+            Protocol: email
+          - !Ref AWS::NoValue
+
+  # Alarms have no actions until AlarmsTopic gains a subscriber;
+  # they exist so the metric history is tracked from day one and
+  # a subscriber can be attached in any later update.
+  DocumentsFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-documents-errors"
+      AlarmDescription: >
+        Any error thrown by the documents Lambda in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DocumentsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  AggregatesFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-aggregates-errors"
+      AlarmDescription: >
+        Any error thrown by the aggregates Lambda in 5 minutes
+        (manual runs and the daily schedule).
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref AggregatesFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  DecisionsFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-decisions-errors"
+      AlarmDescription: >
+        Any error thrown by the decisions Lambda (the write half of
+        the loop - S3 transitions and ledger writes) in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref DecisionsFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  IngestFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ingest-errors"
+      AlarmDescription: >
+        Any error thrown by the ingest Lambda (inventory and
+        access-log imports) in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref IngestFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  ReconciliationFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-reconciliation-errors"
+      AlarmDescription: >
+        Any error thrown by the reconciliation Lambda (Cost Explorer
+        vs model comparisons) in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ReconciliationFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  Api5xxErrorAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-api-5xx"
+      AlarmDescription: >
+        Any 500-class API response (server fault), sampled per
+        minute.
+      Namespace: AWS/ApiGateway
+      MetricName: 5XXError
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref DocumentsHttpApi
+        - Name: Stage
+          Value: "$default"
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  OnCallFunctionErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-oncall-errors"
+      AlarmDescription: >
+        Any error thrown by the on-call Lambda (shift CRUD, alarm
+        paging to PagerDuty, schedule sync) in 5 minutes.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref OnCallFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref AlarmsTopic]
+      OKActions: [!Ref AlarmsTopic]
+
+  # Group names must be independent of the function physical names:
+  # LoggingConfig refs the group, so a !Sub on the function name in
+  # LogGroupName would form a circular dependency (E3004). Prefixing
+  # /aws/lambda/ keeps CloudWatch console filters working.
+  DocumentsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-documents"
+      RetentionInDays: 30
+
+  AggregatesFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-aggregates"
+      RetentionInDays: 30
+
+  DecisionsFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-decisions"
+      RetentionInDays: 30
+
+  IngestFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-ingest"
+      RetentionInDays: 30
+
+  ReconciliationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-reconciliation"
+      RetentionInDays: 30
+
+  OnCallFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${AWS::StackName}-oncall"
+      RetentionInDays: 30
+
+  ApiAccessLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/apigateway/${AWS::StackName}/access"
+      RetentionInDays: 90
+
+  # API Gateway (HTTP APIs) writes stage access logs under its own
+  # service principal, which needs a log-level resource policy.
+  ApiAccessLogsPolicy:
+    Type: AWS::Logs::ResourcePolicy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-apigateway-access-logs"
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action:
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !GetAtt ApiAccessLogs.Arn
 
   DocumentsBucket:
     Type: AWS::S3::Bucket
@@ -17,14 +354,26 @@ Resources:
         BlockPublicPolicy: true
         IgnorePublicAcls: true
         RestrictPublicBuckets: true
+      # Uploads use a presigned PUT issued by the documents Lambda and
+      # go straight from the browser to S3 (never through API
+      # Gateway), so the bucket itself must authorize cross-origin
+      # requests. Downloads use the presigned GET the same way. The
+      # origin is PINNED to the deployed frontend - a wildcard here
+      # would let any site PUT into the bucket with a leaked URL.
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: [Authorization, Content-Type]
+            AllowedMethods: [PUT, GET]
+            AllowedOrigins: [!Ref FrontendOrigin]
+            MaxAge: 3000
 
   DocumentsTable:
     Type: AWS::DynamoDB::Table
     Properties:
-      BillingMode: PROVISIONED
-      ProvisionedThroughput:
-        ReadCapacityUnits: 1
-        WriteCapacityUnits: 1
+      # On-demand capacity: the list endpoint scans the whole table
+      # (1,000+ items), which starves a 1-RCU provision and makes the
+      # Lambda exceed its timeout. On-demand removes the throttling.
+      BillingMode: PAY_PER_REQUEST
       AttributeDefinitions:
         - AttributeName: document_id
           AttributeType: S
@@ -57,6 +406,148 @@ Resources:
         - AttributeName: document_id
           KeyType: HASH
 
+  # One reconciliation report per run: all items share the scope
+  # partition, the run timestamp is the sort key, so "latest" is a
+  # one-element query run backwards.
+  ReconciliationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: scope
+          AttributeType: S
+        - AttributeName: ran_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: scope
+          KeyType: HASH
+        - AttributeName: ran_at
+          KeyType: RANGE
+
+  # Decision records for the approval -> execute -> verify -> ledger
+  # loop. The two GSIs partition the queue by lifecycle state (the
+  # approval queue) and by document (duplicate-proposal guard, per-
+  # document history).
+  DecisionsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: decision_id
+          AttributeType: S
+        - AttributeName: decision_state
+          AttributeType: S
+        - AttributeName: document_id
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+      KeySchema:
+        - AttributeName: decision_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: state-index
+          KeySchema:
+            - AttributeName: decision_state
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: document-index
+          KeySchema:
+            - AttributeName: document_id
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # On-call shift windows (manual, admin-managed). GSIs serve the two
+  # query axes: upcoming/covering shifts per role (newest start wins)
+  # and a per-engineer schedule view.
+  OncallShiftsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: shift_id
+          AttributeType: S
+        - AttributeName: role
+          AttributeType: S
+        - AttributeName: start_at
+          AttributeType: S
+        - AttributeName: engineer_email
+          AttributeType: S
+      KeySchema:
+        - AttributeName: shift_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: role-start-index
+          KeySchema:
+            - AttributeName: role
+              KeyType: HASH
+            - AttributeName: start_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: engineer-start-index
+          KeySchema:
+            - AttributeName: engineer_email
+              KeyType: HASH
+            - AttributeName: start_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # Pagable-alarm audit trail: one row per SNS notification (PK = SNS
+  # MessageId so at-least-once redelivery is idempotent), newest-first
+  # for the history view, per-alarm drill-down via alarm-index.
+  OncallNotificationsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: notification_id
+          AttributeType: S
+        - AttributeName: ts_key
+          AttributeType: S
+        - AttributeName: created_at
+          AttributeType: S
+        - AttributeName: alarm_name
+          AttributeType: S
+      KeySchema:
+        - AttributeName: notification_id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: time-index
+          KeySchema:
+            - AttributeName: ts_key
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+        - IndexName: alarm-index
+          KeySchema:
+            - AttributeName: alarm_name
+              KeyType: HASH
+            - AttributeName: created_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+
+  # Created EMPTY on purpose: no GenerateSecretString means CloudFormation
+  # never stores a PagerDuty credential as a template-resolved value and
+  # never echoes one back. The operator fills it post-deploy with the
+  # routing key, API token and From email (see README); the on-call
+  # Lambda reads it at runtime with GetSecretValue and degrades every
+  # PagerDuty path to an audited skip while it is empty.
+  PagerDutySecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${AWS::StackName}-pagerduty"
+      Description: StorageLens on-call PagerDuty routing key, API token and From email
+
   DocumentsFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -65,6 +556,9 @@ Resources:
       Runtime: python3.13
       Timeout: 10
       MemorySize: 128
+
+      LoggingConfig:
+        LogGroup: !Ref DocumentsFunctionLogGroup
 
       Policies:
         - Statement:
@@ -79,6 +573,8 @@ Resources:
                 - dynamodb:PutItem
                 - dynamodb:GetItem
                 - dynamodb:Scan
+                # confirm-upload flips upload_status conditionally.
+                - dynamodb:UpdateItem
               Resource: !GetAtt DocumentsTable.Arn
 
             - Effect: Allow
@@ -92,21 +588,59 @@ Resources:
           DOCUMENTS_BUCKET: !Ref DocumentsBucket
           DOCUMENTS_TABLE: !Ref DocumentsTable
           ACCESS_HISTORY_TABLE: !Ref AccessHistoryTable
+          USER_POOL_ID: !Ref UserPool
+          CLIENT_ID: !Ref SpaClient
+          # The full hosted-UI HOSTNAME. /config is consumed by
+          # authLogic.ts, which builds https://${auth_domain}/oauth2/*
+          # URLs directly - a bare domain prefix here would make every
+          # sign-in link point at <stack>-auth (NXDOMAIN).
+          AUTH_DOMAIN: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
 
       Events:
-        DocumentsApi:
+        # Explicit methods rather than ANY: an ANY route would capture
+        # OPTIONS preflights and route them to the Lambda (404), while
+        # with explicit methods API Gateway's built-in CORS responder
+        # answers the preflight from the API-level CorsConfiguration.
+        # GET /config is the one PUBLIC route: the sign-in bootstrap -
+        # it hands the pool id, client id and hosted-UI domain to the
+        # frontend, so a fresh clone needs no wiring beyond the API URL.
+        ConfigApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /config
+            Method: GET
+            Auth:
+              Authorizer: NONE
+        DocumentsListApi:
           Type: HttpApi
           Properties:
             ApiId: !Ref DocumentsHttpApi
             Path: /documents
-            Method: ANY
+            Method: GET
+
+        DocumentsCreateApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents
+            Method: POST
+
+        # Truth gate for the presigned PUT: HEAD-verifies the object
+        # exists before the row leaves UPLOAD_PENDING.
+        DocumentConfirmUploadApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /documents/{document_id}/confirm-upload
+            Method: POST
 
         DocumentByIdApi:
           Type: HttpApi
           Properties:
             ApiId: !Ref DocumentsHttpApi
             Path: /documents/{document_id}
-            Method: ANY
+            Method: GET
 
         DocumentDownloadApi:
           Type: HttpApi
@@ -130,6 +664,9 @@ Resources:
       Timeout: 60
       MemorySize: 512
 
+      LoggingConfig:
+        LogGroup: !Ref AggregatesFunctionLogGroup
+
       Policies:
         - Statement:
             - Effect: Allow
@@ -147,6 +684,8 @@ Resources:
               Action:
                 - dynamodb:PutItem
                 - dynamodb:BatchWriteItem
+                - dynamodb:Scan
+                - dynamodb:GetItem
               Resource: !GetAtt DocumentAggregatesTable.Arn
 
       Environment:
@@ -156,6 +695,15 @@ Resources:
           AGGREGATES_TABLE: !Ref DocumentAggregatesTable
 
       Events:
+        # Daily aggregation keeps the optimizer features fresh
+        # without anyone remembering to POST /aggregates/run.
+        AggregatesDailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Daily access-history aggregation run
+            Enabled: true
+
         AggregatesRunApi:
           Type: HttpApi
           Properties:
@@ -163,12 +711,598 @@ Resources:
             Path: /aggregates/run
             Method: POST
 
+        # Live aggregation-pipeline state for the dashboard/optimizer
+        # panels: coverage, last run, class distribution.
+        AggregatesStatsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /aggregates/stats
+            Method: GET
+
+  # The bridge to an existing customer bucket: an S3 Inventory manifest
+  # becomes document rows, S3 server access logs become real access
+  # events. This is what makes the pipeline SEE data that was never
+  # uploaded through this product's own API.
+  IngestFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/ingest/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      # A manifest or day of access logs decompresses in one shot; the
+      # invocation caps (200k rows / 200 files) bound the input.
+      Timeout: 300
+      MemorySize: 512
+
+      LoggingConfig:
+        LogGroup: !Ref IngestFunctionLogGroup
+
+      Policies:
+        - Statement:
+            # BYOC: the imported objects live in buckets the product
+            # does not own (the customer's or a dedicated import
+            # bucket). Read-only, wide, and nothing here can write.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:ListBucket
+                - s3:GetBucketLocation
+              Resource: "*"
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt DocumentsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:BatchWriteItem
+              Resource: !GetAtt AccessHistoryTable.Arn
+
+      Environment:
+        Variables:
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+          ACCESS_HISTORY_TABLE: !Ref AccessHistoryTable
+
+      Events:
+        ImportInventoryApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /imports/inventory
+            Method: POST
+
+        ImportAccessLogsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /imports/access-logs
+            Method: POST
+
+        # The onboarding wizard's preflight: bounded reads that answer
+        # "will an import work here?" without importing anything.
+        ImportCheckApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /imports/check
+            Method: POST
+
+  # Invoice reconciliation: the model's numbers are only worth
+  # something if they are periodically compared with the ACTUAL bill.
+  # Reads S3 usage-type charges from Cost Explorer, predicts the same
+  # months by re-running the engine's storage component over the live
+  # aggregates, and records the variance for the dashboard.
+  ReconciliationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/reconciliation/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      # One GetCostAndUsage over the window + a full aggregates scan.
+      Timeout: 120
+      MemorySize: 256
+
+      LoggingConfig:
+        LogGroup: !Ref ReconciliationFunctionLogGroup
+
+      Policies:
+        - Statement:
+            # Cost Explorer has no resource-level ARNs.
+            - Effect: Allow
+              Action:
+                - ce:GetCostAndUsage
+              Resource: "*"
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt DocumentAggregatesTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Scan
+              Resource: !GetAtt DecisionsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:Query
+              Resource: !GetAtt ReconciliationsTable.Arn
+
+      Environment:
+        Variables:
+          AGGREGATES_TABLE: !Ref DocumentAggregatesTable
+          DECISIONS_TABLE: !Ref DecisionsTable
+          RECONCILIATIONS_TABLE: !Ref ReconciliationsTable
+
+      Events:
+        # Daily check with the bill: a stale or drifting model shows
+        # up as variance without anyone remembering to run it.
+        ReconciliationDailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Daily model-vs-bill reconciliation run
+            Enabled: true
+
+        ReconciliationRunApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /reconciliation/run
+            Method: POST
+
+        ReconciliationResultApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /reconciliation/result
+            Method: GET
+
+        ReconciliationHistoryApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /reconciliation/history
+            Method: GET
+
+  # The write half of the loop: recommendation -> approval -> S3
+  # copy execution -> HEAD verification -> realized-savings ledger.
+  # The engine inside backend/lambdas/decisions/engine/ is a
+  # byte-identical copy of the optimization/ package (pinned by
+  # tests), so live decisions use the same cost model as the
+  # offline experiments.
+  DecisionsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/decisions/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      # Copy-based storage-class transitions on larger legal files
+      # can exceed a 10 s budget.
+      Timeout: 60
+      MemorySize: 256
+
+      LoggingConfig:
+        LogGroup: !Ref DecisionsFunctionLogGroup
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+                - dynamodb:UpdateItem
+              Resource: !GetAtt DocumentsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:Scan
+              Resource: !GetAtt DocumentAggregatesTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:PutItem
+                - dynamodb:GetItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource: !GetAtt DecisionsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource: !Sub "${DecisionsTable.Arn}/index/*"
+
+            # copy_object reads the source and writes the copy in
+            # place; head_object verifies the result.
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+              Resource: !Sub "${DocumentsBucket.Arn}/*"
+
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET: !Ref DocumentsBucket
+          DOCUMENTS_TABLE: !Ref DocumentsTable
+          AGGREGATES_TABLE: !Ref DocumentAggregatesTable
+          DECISIONS_TABLE: !Ref DecisionsTable
+
+      Events:
+        # Explicit methods rather than ANY (see DocumentsFunction):
+        # OPTIONS preflights stay on API Gateway's CORS responder,
+        # and GET /decisions/{id}/execute 405s inside the handler
+        # instead of reaching the S3 copy.
+        DecisionsCreateApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions
+            Method: POST
+
+        # Records proposals for every live aggregate the engine
+        # migrates (capped per call) - makes the approval queue
+        # self-service after a run of aggregation.
+        DecisionsProposeBatchApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions/propose-batch
+            Method: POST
+
+        # Live fleet projection over the aggregates table.
+        FleetProjectionApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /fleet/projection
+            Method: GET
+
+        DecisionsListApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions
+            Method: GET
+
+        DecisionApproveApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions/{decision_id}/approve
+            Method: POST
+
+        DecisionRejectApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions/{decision_id}/reject
+            Method: POST
+
+        DecisionExecuteApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions/{decision_id}/execute
+            Method: POST
+
+        DecisionByIdApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /decisions/{decision_id}
+            Method: GET
+
+        LedgerApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /ledger
+            Method: GET
+
+  # On-call shift scheduling + PagerDuty integration: shift CRUD with
+  # coverage resolution, the SNS subscriber that pages PagerDuty when
+  # alarms fire (and resolves them on recovery), a daily override
+  # reconciler, and the audit trail of every paging decision.
+  OnCallFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/lambdas/oncall/
+      Handler: app.lambda_handler
+      Runtime: python3.13
+      # One alarm page or override sync is a handful of sub-second
+      # HTTPS calls; the reconciler lists a 30-day override window.
+      Timeout: 30
+      MemorySize: 128
+
+      LoggingConfig:
+        LogGroup: !Ref OnCallFunctionLogGroup
+
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:DeleteItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource: !GetAtt OncallShiftsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${OncallShiftsTable.Arn}/index/*"
+
+            - Effect: Allow
+              Action:
+                - dynamodb:GetItem
+                - dynamodb:PutItem
+                - dynamodb:UpdateItem
+                - dynamodb:Query
+                - dynamodb:Scan
+              Resource: !GetAtt OncallNotificationsTable.Arn
+
+            - Effect: Allow
+              Action:
+                - dynamodb:Query
+              Resource: !Sub "${OncallNotificationsTable.Arn}/index/*"
+
+            # Runtime-only read of the operator-filled credential.
+            # No PutSecretValue/CreateSecret on the runtime role.
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+                - secretsmanager:DescribeSecret
+              # Ref returns the secret's ARN. GetAtt is not usable here:
+              # SecretsManager::Secret exposes no Arn attribute, and
+              # CFN's early-validation hook rejects the reference.
+              Resource: !Ref PagerDutySecret
+
+      Environment:
+        Variables:
+          SHIFTS_TABLE: !Ref OncallShiftsTable
+          NOTIFICATIONS_TABLE: !Ref OncallNotificationsTable
+          PD_SCHEDULE_ID: !Ref PagerDutyScheduleId
+          PD_SECRET_ARN: !Ref PagerDutySecret
+          STACK_NAME: !Ref AWS::StackName
+
+      Events:
+        # Explicit methods rather than ANY (see DocumentsFunction):
+        # OPTIONS preflights stay on API Gateway's CORS responder.
+        OnCallMeApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/me
+            Method: GET
+
+        OnCallCurrentApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/current
+            Method: GET
+
+        OnCallShiftsListApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/shifts
+            Method: GET
+
+        OnCallShiftsCreateApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/shifts
+            Method: POST
+
+        OnCallShiftByIdApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/shifts/{shift_id}
+            Method: PUT
+
+        OnCallShiftDeleteApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/shifts/{shift_id}
+            Method: DELETE
+
+        OnCallSyncApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/sync
+            Method: POST
+
+        OnCallNotificationsApi:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref DocumentsHttpApi
+            Path: /oncall/notifications
+            Method: GET
+
+        # CloudWatch alarms publish directly to the topic; the SNS
+        # subscription invokes this function (SAM wires the
+        # subscription and the invoke permission).
+        AlarmPagingSubscription:
+          Type: SNS
+          Properties:
+            Topic: !Ref AlarmsTopic
+
+        # Daily convergence of our shifts into PagerDuty overrides,
+        # so drift (manual PD edits, failed syncs) self-heals.
+        OnCallDailyReconcile:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 day)
+            Description: Daily on-call rotation sync into PagerDuty overrides
+            Enabled: true
+
   DocumentsHttpApi:
     Type: AWS::Serverless::HttpApi
     Properties:
       StageName: $default
+      # The frontend runs on its own origin (Vite dev server or the
+      # CloudFront Distribution below), so the API must answer CORS
+      # preflights. Authorization is via a Bearer token in a custom
+      # header, not cookies, and the origin is PINNED to the deployed
+      # frontend rather than "*": any site could read authenticated
+      # responses through cross-origin fetches otherwise.
+      CorsConfiguration:
+        AllowOrigins:
+          - !Ref FrontendOrigin
+        AllowMethods:
+          - "*"
+        AllowHeaders:
+          - Authorization
+          - Content-Type
+        MaxAge: 600
+      # Every route requires a Cognito-issued JWT (see UserPool);
+      # GET /config is the one public route - it tells the frontend
+      # which pool to sign in against. CORS preflights are answered
+      # by API Gateway itself and are never authorized.
+      Auth:
+        DefaultAuthorizer: CognitoAuth
+        Authorizers:
+          CognitoAuth:
+            IdentitySource: "$request.header.Authorization"
+            JwtConfiguration:
+              Audience: [!Ref SpaClient]
+              Issuer: !Sub "https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}"
+      # Route-level throttling: a single unauthenticated client (or
+      # a runaway loop) cannot exceed 50 req/s sustained and 100
+      # burst, which caps DynamoDB scan and presign costs.
+      DefaultRouteSettings:
+        ThrottlingRateLimit: 50
+        ThrottlingBurstLimit: 100
+      # Access logs flow into a retained log group; without a
+      # retention policy an HTTP API stage keeps logs forever.
+      AccessLogSettings:
+        DestinationArn: !GetAtt ApiAccessLogs.Arn
+        Format: >-
+          {"requestId":"$context.requestId","ip":"$context.identity.sourceIp","method":"$context.httpMethod","path":"$context.path","status":"$context.status","error":"$context.error.message"}
+
+  # ---- Frontend hosting ----------------------------------------------
+  #
+  # The built SPA ships from a private S3 bucket through CloudFront
+  # (Origin Access Control, no public bucket ACLs). Deep links work
+  # by answering 403/404 with /index.html so the router takes over.
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerEnforced
+
+  # Bucket policy tied to THIS distribution's ARN - not an open
+  # cloudfront.amazonaws.com access grant.
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub
+                  - "arn:aws:cloudfront::${AccountId}:distribution/${DistributionId}"
+                  - AccountId: !Ref AWS::AccountId
+                    DistributionId: !Ref FrontendDistribution
+
+  FrontendOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${AWS::StackName} StorageLens SPA"
+        DefaultRootObject: index.html
+        HttpVersion: http2
+        # Cheapest: one edge region grouping - fine for a single-team
+        # deployment; raise it when the team spans continents.
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: frontend-s3-origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            # OAC lives on the Origin (sibling of S3OriginConfig) per
+            # the CloudFront schema; nesting it inside S3OriginConfig
+            # passes CFN's early property validation as E3002.
+            OriginAccessControlId: !GetAtt FrontendOriginAccessControl.Id
+            S3OriginConfig: {}
+        DefaultCacheBehavior:
+          TargetOriginId: frontend-s3-origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          # Managed-CachingOptimized policy id (fixed AWS value).
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # SPA fallback: unknown routes serve the app shell (200), the
+        # react-router resolves client-side. A short error-cache TTL
+        # keeps fixes visible quickly.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 5
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 5
 
 Outputs:
+
+  UserPoolId:
+    Description: Cognito user pool backing the API's JWT authorizer
+    Value: !Ref UserPool
+
+  SpaClientId:
+    Description: Public client id the StorageLens frontend signs in with
+    Value: !Ref SpaClient
+
+  CognitoDomain:
+    Description: >-
+      Hosted-UI hostname used for the authorization-code + PKCE sign-in
+      flow (the full *.auth.<region>.amazoncognito.com URL)
+    Value: !Sub "${UserPoolDomain}.auth.${AWS::Region}.amazoncognito.com"
+
+  FrontendOrigin:
+    Description: Origin configured as the sign-in callback target
+    Value: !Ref FrontendOrigin
 
   DocumentsBucketName:
     Description: S3 bucket used for project documents
@@ -189,3 +1323,28 @@ Outputs:
   DocumentAggregatesTableName:
     Description: DynamoDB table containing aggregated document optimization features
     Value: !Ref DocumentAggregatesTable
+
+  DecisionsTableName:
+    Description: DynamoDB table holding the approval/execution/verification decisions
+    Value: !Ref DecisionsTable
+  FrontendBucketName:
+    Description: S3 bucket holding the built SPA (served via CloudFront)
+    Value: !Ref FrontendBucket
+
+  FrontendDistributionDomain:
+    Description: Hostname to serve the StorageLens frontend from
+    Value: !GetAtt FrontendDistribution.DomainName
+
+  OncallShiftsTableName:
+    Description: DynamoDB table holding on-call shift windows
+    Value: !Ref OncallShiftsTable
+
+  OncallNotificationsTableName:
+    Description: DynamoDB table holding the paging decision audit trail
+    Value: !Ref OncallNotificationsTable
+
+  PagerDutySecretArn:
+    Description: >
+      Secrets Manager secret that must be filled post-deploy with the
+      PagerDuty credentials (routing_key, api_token, from_email)
+    Value: !Ref PagerDutySecret
