@@ -50,3 +50,4 @@ data/real/download_cache/
 
 # AWS SAM generated files
 .aws-sam/
+product_audit.md 
