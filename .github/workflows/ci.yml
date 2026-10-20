@@ -15,6 +15,9 @@ jobs:
   backend:
     name: Backend (pytest)
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      AWS_DEFAULT_REGION: ap-south-1
     steps:
       - uses: actions/checkout@v4
 
@@ -58,6 +61,9 @@ jobs:
   template:
     name: Template (sam validate + hardening)
     runs-on: ubuntu-latest
+    env:
+      PYTHONPATH: .
+      AWS_DEFAULT_REGION: ap-south-1
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +82,7 @@ jobs:
         run: pip install -r requirements-dev.txt
 
       - name: Validate template
-        run: sam validate --template infrastructure/template.yaml
+        run: sam validate --template infrastructure/template.yaml --lint
 
       - name: Template + preflight hardening tests
         run: |
